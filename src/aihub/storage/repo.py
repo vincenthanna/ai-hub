@@ -12,7 +12,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from ..errors import Conflict, NotFound
 from ..ids import new_ulid, now_ms
-from ..textutil import bigrams, build_match_expr, truncate
+from ..textutil import bigrams, build_match_expr, normalize, truncate
 
 log = logging.getLogger("aihub.storage.repo")
 
@@ -22,6 +22,11 @@ FTS_BIGRAM_CHARS = 4000
 PREVIEW_CHARS = 400
 SUMMARY_CHARS = 200
 UNSORTED = "unsorted"
+# A new label starts with everything older than this already acknowledged. Zero
+# would replay the entire backlog; no window at all would hide the handoff that
+# was posted seconds before the receiving session first ran, which is exactly
+# the flow this hub exists for.
+NEW_AGENT_GRACE_MS = 24 * 60 * 60 * 1000
 
 
 def iso(ms: Optional[int]) -> Optional[str]:
@@ -62,30 +67,45 @@ class Repo:
         )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
-    def _touch_agent(self, conn: sqlite3.Connection, label: str, *, sent: bool = False) -> None:
+    def _touch_agent(
+        self,
+        conn: sqlite3.Connection,
+        label: str,
+        *,
+        sent: bool = False,
+        addressed_only: bool = False,
+    ) -> bool:
+        """Register or refresh a label. Returns True when it was newly created."""
         ts = now_ms()
-        row = conn.execute("SELECT label FROM agents WHERE label = ?", (label,)).fetchone()
+        row = conn.execute(
+            "SELECT label, seen_as FROM agents WHERE label = ?", (label,)
+        ).fetchone()
         if row is None:
-            # A brand-new label starts with its broadcast watermark at the current
-            # head, so it does not inherit every past broadcast as unread.
-            head = conn.execute("SELECT COALESCE(MAX(seq), 0) FROM items").fetchone()[0]
+            # Anything older than the grace window counts as already seen.
+            head = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM items WHERE created_ms < ?",
+                (ts - NEW_AGENT_GRACE_MS,),
+            ).fetchone()[0]
             conn.execute(
-                "INSERT INTO agents(label, first_seen_ms, last_seen_ms, sent_count) VALUES(?,?,?,?)",
-                (label, ts, ts, 1 if sent else 0),
+                "INSERT INTO agents(label, first_seen_ms, last_seen_ms, sent_count, seen_as)"
+                " VALUES(?,?,?,?,?)",
+                (label, ts, ts, 1 if sent else 0, "addressed" if addressed_only else "sender"),
             )
             conn.execute(
                 "INSERT OR IGNORE INTO agent_cursors(recipient, broadcast_seq, updated_ms)"
                 " VALUES(?,?,?)",
                 (label, head, ts),
             )
-        else:
-            if sent:
-                conn.execute(
-                    "UPDATE agents SET last_seen_ms = ?, sent_count = sent_count + 1 WHERE label = ?",
-                    (ts, label),
-                )
-            else:
-                conn.execute("UPDATE agents SET last_seen_ms = ? WHERE label = ?", (ts, label))
+            return True
+        if addressed_only:
+            # Do not refresh last_seen for a label nobody has actually polled as.
+            return False
+        conn.execute(
+            "UPDATE agents SET last_seen_ms = ?, seen_as = 'sender',"
+            " sent_count = sent_count + ? WHERE label = ?",
+            (ts, 1 if sent else 0, label),
+        )
+        return False
 
     def ensure_agent(self, label: str) -> None:
         with self.db.write() as conn:
@@ -100,17 +120,22 @@ class Repo:
         body: str,
         tags: Sequence[str],
     ) -> None:
-        head = body[:FTS_BODY_CHARS]
+        # Queries are NFKC-normalized before they become a MATCH expression, so
+        # the index has to be built from normalized text or compatibility jamo
+        # and full-width input silently fails to match itself.
+        n_title = normalize(title)
+        n_summary = normalize(summary)
+        head = normalize(body)[:FTS_BODY_CHARS]
         conn.execute("DELETE FROM items_fts WHERE rowid = ?", (seq,))
         conn.execute(
             "INSERT INTO items_fts(rowid, title, summary, body, body_bi, tags)"
             " VALUES(?,?,?,?,?,?)",
             (
                 seq,
-                title,
-                summary,
+                n_title,
+                n_summary,
                 head,
-                bigrams(title + " " + summary + " " + head, FTS_BIGRAM_CHARS),
+                bigrams(n_title + " " + n_summary + " " + head, FTS_BIGRAM_CHARS),
                 " ".join(tags),
             ),
         )
@@ -174,8 +199,9 @@ class Repo:
 
         if client_msg_id:
             existing = self.db.query_one(
-                "SELECT item_id, payload_sha256 FROM items WHERE client_msg_id = ?",
-                (client_msg_id,),
+                "SELECT item_id, payload_sha256 FROM items"
+                " WHERE sender = ? AND client_msg_id = ?",
+                (sender, client_msg_id),
             )
             if existing is not None:
                 if existing["payload_sha256"] == payload_hash:
@@ -189,14 +215,16 @@ class Repo:
         ts = now_ms()
         body_bytes = len(body.encode("utf-8"))
         store_in_db = body_rel_path is None and body_bytes <= BODY_DB_LIMIT
+        warnings: List[str] = []
         first_line = body.strip().splitlines()[0] if body.strip() else ""
         summary = truncate(title or first_line, SUMMARY_CHARS)
 
         with self.db.write() as conn:
             if client_msg_id:
                 dup = conn.execute(
-                    "SELECT item_id, payload_sha256 FROM items WHERE client_msg_id = ?",
-                    (client_msg_id,),
+                    "SELECT item_id, payload_sha256 FROM items"
+                    " WHERE sender = ? AND client_msg_id = ?",
+                    (sender, client_msg_id),
                 ).fetchone()
                 if dup is not None:
                     if dup["payload_sha256"] == payload_hash:
@@ -271,7 +299,15 @@ class Repo:
                     " VALUES(?,?,?,'pending',?)",
                     (item_id, recipient, seq, ts),
                 )
-                self._touch_agent(conn, recipient)
+                created = self._touch_agent(conn, recipient, addressed_only=True)
+                seen = conn.execute(
+                    "SELECT seen_as FROM agents WHERE label = ?", (recipient,)
+                ).fetchone()
+                if created or (seen is not None and seen["seen_as"] == "addressed"):
+                    warnings.append(
+                        "no session has ever polled as '%s'; the message is stored but"
+                        " may be waiting on a label that does not exist" % recipient
+                    )
             self._touch_agent(conn, sender, sent=True)
             if topic_id:
                 conn.execute(
@@ -291,7 +327,52 @@ class Repo:
                     " ON CONFLICT(item_id, input_hash) DO NOTHING",
                     (new_ulid(), item_id, input_hash, ts, ts),
                 )
-            return self._get_item_conn(conn, item_id), False
+            out = self._get_item_conn(conn, item_id)
+            out["warnings"] = warnings
+            return out, False
+
+    @staticmethod
+    def _compact_broadcast_acks(conn: sqlite3.Connection, recipient: str, ts: int) -> None:
+        """Fold a contiguous run of individual acks into the watermark.
+
+        Keeping only the gaps bounds the exception table: acknowledging in order
+        leaves nothing behind, and out-of-order acks cost one row until the gap
+        below them is filled.
+        """
+        row = conn.execute(
+            "SELECT broadcast_seq FROM agent_cursors WHERE recipient = ?", (recipient,)
+        ).fetchone()
+        cursor = int(row["broadcast_seq"]) if row else 0
+        while True:
+            nxt = conn.execute(
+                "SELECT MIN(seq) AS s FROM items"
+                " WHERE is_broadcast = 1 AND seq > ? AND sender <> ? AND status <> 'deleted'",
+                (cursor, recipient),
+            ).fetchone()["s"]
+            if nxt is None:
+                # Nothing left unread; the watermark can jump to the head.
+                head = conn.execute(
+                    "SELECT COALESCE(MAX(seq), 0) AS s FROM items WHERE is_broadcast = 1"
+                ).fetchone()["s"]
+                cursor = max(cursor, int(head))
+                break
+            acked = conn.execute(
+                "SELECT 1 FROM broadcast_acks WHERE recipient = ? AND seq = ?",
+                (recipient, int(nxt)),
+            ).fetchone()
+            if acked is None:
+                break
+            cursor = int(nxt)
+        conn.execute(
+            "INSERT INTO agent_cursors(recipient, broadcast_seq, updated_ms) VALUES(?,?,?)"
+            " ON CONFLICT(recipient) DO UPDATE SET"
+            " broadcast_seq = MAX(broadcast_seq, excluded.broadcast_seq),"
+            " updated_ms = excluded.updated_ms",
+            (recipient, cursor, ts),
+        )
+        conn.execute(
+            "DELETE FROM broadcast_acks WHERE recipient = ? AND seq <= ?", (recipient, cursor)
+        )
 
     def ack(
         self,
@@ -318,13 +399,39 @@ class Repo:
                     "SELECT COALESCE(MAX(seq), 0) FROM items WHERE is_broadcast = 1"
                 ).fetchone()[0]
                 broadcast_upto_seq = max(broadcast_upto_seq or 0, int(head))
+                conn.execute("DELETE FROM broadcast_acks WHERE recipient = ?", (recipient,))
+            broadcast_seqs: List[int] = []
             for item_id in dict.fromkeys(targets):
                 row = conn.execute(
                     "SELECT state FROM deliveries WHERE item_id = ? AND recipient = ?",
                     (item_id, recipient),
                 ).fetchone()
                 if row is None:
-                    missing.append(item_id)
+                    # Not addressed to this label: it may still be a broadcast the
+                    # caller has just handled, which is acknowledged per item.
+                    item = conn.execute(
+                        "SELECT seq, is_broadcast FROM items WHERE item_id = ?", (item_id,)
+                    ).fetchone()
+                    if item is None or not item["is_broadcast"]:
+                        missing.append(item_id)
+                        continue
+                    seq = int(item["seq"])
+                    cur = conn.execute(
+                        "SELECT broadcast_seq FROM agent_cursors WHERE recipient = ?",
+                        (recipient,),
+                    ).fetchone()
+                    if cur is not None and seq <= int(cur["broadcast_seq"]):
+                        already += 1
+                        continue
+                    exists = conn.execute(
+                        "SELECT 1 FROM broadcast_acks WHERE recipient = ? AND seq = ?",
+                        (recipient, seq),
+                    ).fetchone()
+                    if exists is not None:
+                        already += 1
+                        continue
+                    broadcast_seqs.append(seq)
+                    acked += 1
                     continue
                 if row["state"] == "acked":
                     already += 1
@@ -335,6 +442,13 @@ class Repo:
                     (ts, note, item_id, recipient),
                 )
                 acked += 1
+            if broadcast_seqs:
+                for seq in broadcast_seqs:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO broadcast_acks(recipient, seq, acked_ms)"
+                        " VALUES(?,?,?)",
+                        (recipient, int(seq), ts),
+                    )
             if broadcast_upto_seq is not None:
                 conn.execute(
                     "INSERT INTO agent_cursors(recipient, broadcast_seq, updated_ms) VALUES(?,?,?)"
@@ -343,6 +457,7 @@ class Repo:
                     " updated_ms = excluded.updated_ms",
                     (recipient, int(broadcast_upto_seq), ts),
                 )
+            self._compact_broadcast_acks(conn, recipient, ts)
             cursor_row = conn.execute(
                 "SELECT broadcast_seq FROM agent_cursors WHERE recipient = ?", (recipient,)
             ).fetchone()
@@ -454,7 +569,8 @@ class Repo:
         return ""
 
     def read_body(self, item_id: str) -> str:
-        return self._read_body_conn(self.db.reader(), item_id)
+        with self.db.read() as conn:
+            return self._read_body_conn(conn, item_id)
 
     def _tags_for(self, conn: sqlite3.Connection, item_id: str) -> List[str]:
         return [
@@ -563,7 +679,8 @@ class Repo:
         return out
 
     def get_item(self, item_id: str) -> Dict[str, Any]:
-        return self._get_item_conn(self.db.reader(), item_id)
+        with self.db.read() as conn:
+            return self._get_item_conn(conn, item_id)
 
     def get_attachment(self, item_id: str, attachment_id: str) -> Dict[str, Any]:
         row = self.db.query_one(
@@ -587,45 +704,45 @@ class Repo:
         until_ms: Optional[int] = None,
         order: str = "desc",
     ) -> Tuple[List[Dict[str, Any]], Optional[int]]:
-        conn = self.db.reader()
-        where = ["i.status <> 'deleted'"]
-        params: List[Any] = []
-        if topic:
-            where.append("(i.topic_id = ? OR i.topic_id LIKE ? || '-%')")
-            params.extend([topic, topic])
-        if kinds:
-            where.append("i.kind IN (%s)" % ",".join("?" * len(kinds)))
-            params.extend(kinds)
-        if sender:
-            where.append("i.sender = ?")
-            params.append(sender)
-        if recipient:
-            where.append(
-                "(i.is_broadcast = 1 OR EXISTS("
-                " SELECT 1 FROM deliveries d WHERE d.item_id = i.item_id AND d.recipient = ?))"
+        with self.db.read() as conn:
+            where = ["i.status <> 'deleted'"]
+            params: List[Any] = []
+            if topic:
+                where.append("(i.topic_id = ? OR i.topic_id LIKE ? || '-%')")
+                params.extend([topic, topic])
+            if kinds:
+                where.append("i.kind IN (%s)" % ",".join("?" * len(kinds)))
+                params.extend(kinds)
+            if sender:
+                where.append("i.sender = ?")
+                params.append(sender)
+            if recipient:
+                where.append(
+                    "(i.is_broadcast = 1 OR EXISTS("
+                    " SELECT 1 FROM deliveries d WHERE d.item_id = i.item_id AND d.recipient = ?))"
+                )
+                params.append(recipient)
+            if since_ms is not None:
+                where.append("i.created_ms >= ?")
+                params.append(since_ms)
+            if until_ms is not None:
+                where.append("i.created_ms < ?")
+                params.append(until_ms)
+            descending = order != "asc"
+            if after_seq is not None:
+                where.append("i.seq < ?" if descending else "i.seq > ?")
+                params.append(after_seq)
+            sql = (
+                "SELECT i.* FROM items i WHERE %s ORDER BY i.seq %s LIMIT ?"
+                % (" AND ".join(where), "DESC" if descending else "ASC")
             )
-            params.append(recipient)
-        if since_ms is not None:
-            where.append("i.created_ms >= ?")
-            params.append(since_ms)
-        if until_ms is not None:
-            where.append("i.created_ms < ?")
-            params.append(until_ms)
-        descending = order != "asc"
-        if after_seq is not None:
-            where.append("i.seq < ?" if descending else "i.seq > ?")
-            params.append(after_seq)
-        sql = (
-            "SELECT i.* FROM items i WHERE %s ORDER BY i.seq %s LIMIT ?"
-            % (" AND ".join(where), "DESC" if descending else "ASC")
-        )
-        params.append(limit + 1)
-        rows = conn.execute(sql, params).fetchall()
-        has_more = len(rows) > limit
-        rows = rows[:limit]
-        items = [self._summary_row(conn, r) for r in rows]
-        next_seq = int(rows[-1]["seq"]) if has_more and rows else None
-        return items, next_seq
+            params.append(limit + 1)
+            rows = conn.execute(sql, params).fetchall()
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+            items = [self._summary_row(conn, r) for r in rows]
+            next_seq = int(rows[-1]["seq"]) if has_more and rows else None
+            return items, next_seq
 
     def search(
         self,
@@ -641,74 +758,74 @@ class Repo:
         since_ms: Optional[int] = None,
         until_ms: Optional[int] = None,
     ) -> Tuple[List[Dict[str, Any]], bool]:
-        conn = self.db.reader()
-        expr = build_match_expr(query)
-        if not expr:
-            items, _ = self.list_items(
-                limit=limit,
-                topic=topic,
-                kinds=kinds,
-                sender=sender,
-                recipient=recipient,
-                since_ms=since_ms,
-                until_ms=until_ms,
-            )
-            for item in items:
-                item["score"] = 0.0
-                item["snippet"] = item.get("body_preview", "")
-            return items, False
+        with self.db.read() as conn:
+            expr = build_match_expr(query)
+            if not expr:
+                items, _ = self.list_items(
+                    limit=limit,
+                    topic=topic,
+                    kinds=kinds,
+                    sender=sender,
+                    recipient=recipient,
+                    since_ms=since_ms,
+                    until_ms=until_ms,
+                )
+                for item in items:
+                    item["score"] = 0.0
+                    item["snippet"] = item.get("body_preview", "")
+                return items, False
 
-        where = ["items_fts MATCH ?", "i.status <> 'deleted'"]
-        params: List[Any] = [expr]
-        if topic:
-            where.append("(i.topic_id = ? OR i.topic_id LIKE ? || '-%')")
-            params.extend([topic, topic])
-        if kinds:
-            where.append("i.kind IN (%s)" % ",".join("?" * len(kinds)))
-            params.extend(kinds)
-        if sender:
-            where.append("i.sender = ?")
-            params.append(sender)
-        if recipient:
-            where.append(
-                "(i.is_broadcast = 1 OR EXISTS("
-                " SELECT 1 FROM deliveries d WHERE d.item_id = i.item_id AND d.recipient = ?))"
-            )
-            params.append(recipient)
-        if since_ms is not None:
-            where.append("i.created_ms >= ?")
-            params.append(since_ms)
-        if until_ms is not None:
-            where.append("i.created_ms < ?")
-            params.append(until_ms)
-        if tags:
-            where.append(
-                "(SELECT COUNT(*) FROM item_tags t WHERE t.item_id = i.item_id"
-                " AND t.tag_id IN (%s)) = ?" % ",".join("?" * len(tags))
-            )
-            params.extend(list(tags))
-            params.append(len(tags))
+            where = ["items_fts MATCH ?", "i.status <> 'deleted'"]
+            params: List[Any] = [expr]
+            if topic:
+                where.append("(i.topic_id = ? OR i.topic_id LIKE ? || '-%')")
+                params.extend([topic, topic])
+            if kinds:
+                where.append("i.kind IN (%s)" % ",".join("?" * len(kinds)))
+                params.extend(kinds)
+            if sender:
+                where.append("i.sender = ?")
+                params.append(sender)
+            if recipient:
+                where.append(
+                    "(i.is_broadcast = 1 OR EXISTS("
+                    " SELECT 1 FROM deliveries d WHERE d.item_id = i.item_id AND d.recipient = ?))"
+                )
+                params.append(recipient)
+            if since_ms is not None:
+                where.append("i.created_ms >= ?")
+                params.append(since_ms)
+            if until_ms is not None:
+                where.append("i.created_ms < ?")
+                params.append(until_ms)
+            if tags:
+                where.append(
+                    "(SELECT COUNT(*) FROM item_tags t WHERE t.item_id = i.item_id"
+                    " AND t.tag_id IN (%s)) = ?" % ",".join("?" * len(tags))
+                )
+                params.extend(list(tags))
+                params.append(len(tags))
 
-        sql = (
-            "SELECT i.*, "
-            " (-bm25(items_fts, 8.0, 5.0, 1.0, 1.2, 3.0))"
-            "   * (0.35 + 0.65 * recency(i.created_ms, ?))"
-            "   * (1.0 + 0.15 * (i.importance - 3)) AS score,"
-            " snippet(items_fts, 2, '[', ']', ' … ', 16) AS snip"
-            " FROM items_fts JOIN items i ON i.seq = items_fts.rowid"
-            " WHERE %s ORDER BY score DESC LIMIT ? OFFSET ?" % " AND ".join(where)
-        )
-        rows = conn.execute(sql, [now_ms()] + params + [limit + 1, offset]).fetchall()
-        has_more = len(rows) > limit
-        rows = rows[:limit]
-        out = []
-        for row in rows:
-            item = self._summary_row(conn, row)
-            item["score"] = round(float(row["score"]), 6)
-            item["snippet"] = row["snip"] or item.get("body_preview", "")
-            item.pop("body_preview", None)
-            out.append(item)
-        return out, has_more
+            sql = (
+                "SELECT i.*, "
+                " (-bm25(items_fts, 8.0, 5.0, 1.0, 1.2, 3.0))"
+                "   * (0.35 + 0.65 * recency(i.created_ms, ?))"
+                "   * (1.0 + 0.15 * (i.importance - 3)) AS score,"
+                " snippet(items_fts, 2, '[', ']', ' … ', 16) AS snip"
+                " FROM items_fts JOIN items i ON i.seq = items_fts.rowid"
+                " WHERE %s ORDER BY score DESC LIMIT ? OFFSET ?" % " AND ".join(where)
+            )
+            rows = conn.execute(sql, [now_ms()] + params + [limit + 1, offset]).fetchall()
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+            out = []
+            for row in rows:
+                item = self._summary_row(conn, row)
+                item["score"] = round(float(row["score"]), 6)
+                item["snippet"] = row["snip"] or item.get("body_preview", "")
+                item.pop("body_preview", None)
+                out.append(item)
+            return out, has_more
 
     def inbox(
         self,
@@ -719,71 +836,75 @@ class Repo:
         kinds: Optional[Sequence[str]] = None,
         topics: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
-        conn = self.db.reader()
-        cursor_row = conn.execute(
-            "SELECT broadcast_seq FROM agent_cursors WHERE recipient = ?", (recipient,)
-        ).fetchone()
-        cursor_seq = int(cursor_row["broadcast_seq"]) if cursor_row else 0
+        with self.db.read() as conn:
+            cursor_row = conn.execute(
+                "SELECT broadcast_seq FROM agent_cursors WHERE recipient = ?", (recipient,)
+            ).fetchone()
+            cursor_seq = int(cursor_row["broadcast_seq"]) if cursor_row else 0
 
-        direct_sql = (
-            "SELECT i.*, 'direct' AS delivery_kind FROM deliveries d"
-            " JOIN items i ON i.item_id = d.item_id"
-            " WHERE d.recipient = ? AND d.state = 'pending' AND i.status <> 'deleted'"
-        )
-        params: List[Any] = [recipient]
-        if kinds:
-            direct_sql += " AND i.kind IN (%s)" % ",".join("?" * len(kinds))
-            params.extend(kinds)
-        direct_sql += " ORDER BY i.seq ASC LIMIT ?"
-        params.append(limit + 1)
-        rows = list(conn.execute(direct_sql, params).fetchall())
-
-        if include_broadcast and len(rows) <= limit:
-            bsql = (
-                "SELECT i.*, 'broadcast' AS delivery_kind FROM items i"
-                " WHERE i.is_broadcast = 1 AND i.seq > ? AND i.sender <> ?"
-                " AND i.status <> 'deleted'"
+            direct_sql = (
+                "SELECT i.*, 'direct' AS delivery_kind FROM deliveries d"
+                " JOIN items i ON i.item_id = d.item_id"
+                " WHERE d.recipient = ? AND d.state = 'pending' AND i.status <> 'deleted'"
             )
-            bparams: List[Any] = [cursor_seq, recipient]
+            params: List[Any] = [recipient]
             if kinds:
-                bsql += " AND i.kind IN (%s)" % ",".join("?" * len(kinds))
-                bparams.extend(kinds)
-            if topics:
-                bsql += " AND i.topic_id IN (%s)" % ",".join("?" * len(topics))
-                bparams.extend(topics)
-            bsql += " ORDER BY i.seq ASC LIMIT ?"
-            bparams.append(limit + 1 - len(rows))
-            rows.extend(conn.execute(bsql, bparams).fetchall())
+                direct_sql += " AND i.kind IN (%s)" % ",".join("?" * len(kinds))
+                params.extend(kinds)
+            direct_sql += " ORDER BY i.seq ASC LIMIT ?"
+            params.append(limit + 1)
+            rows = list(conn.execute(direct_sql, params).fetchall())
 
-        has_more = len(rows) > limit
-        rows = rows[:limit]
-        items = []
-        for row in rows:
-            item = self._summary_row(conn, row)
-            item["delivery_kind"] = row["delivery_kind"]
-            items.append(item)
+            if include_broadcast and len(rows) <= limit:
+                bsql = (
+                    "SELECT i.*, 'broadcast' AS delivery_kind FROM items i"
+                    " WHERE i.is_broadcast = 1 AND i.seq > ? AND i.sender <> ?"
+                    " AND i.status <> 'deleted'"
+                    " AND NOT EXISTS(SELECT 1 FROM broadcast_acks a"
+                    "                WHERE a.recipient = ? AND a.seq = i.seq)"
+                )
+                bparams: List[Any] = [cursor_seq, recipient, recipient]
+                if kinds:
+                    bsql += " AND i.kind IN (%s)" % ",".join("?" * len(kinds))
+                    bparams.extend(kinds)
+                if topics:
+                    bsql += " AND i.topic_id IN (%s)" % ",".join("?" * len(topics))
+                    bparams.extend(topics)
+                bsql += " ORDER BY i.seq ASC LIMIT ?"
+                bparams.append(limit + 1 - len(rows))
+                rows.extend(conn.execute(bsql, bparams).fetchall())
 
-        pending = conn.execute(
-            "SELECT COUNT(*) FROM deliveries WHERE recipient = ? AND state = 'pending'",
-            (recipient,),
-        ).fetchone()[0]
-        head = conn.execute(
-            "SELECT COALESCE(MAX(seq), 0) FROM items WHERE is_broadcast = 1"
-        ).fetchone()[0]
-        unseen_broadcast = conn.execute(
-            "SELECT COUNT(*) FROM items WHERE is_broadcast = 1 AND seq > ? AND sender <> ?"
-            " AND status <> 'deleted'",
-            (cursor_seq, recipient),
-        ).fetchone()[0]
-        return {
-            "recipient": recipient,
-            "items": items,
-            "broadcast_cursor_seq": cursor_seq,
-            "broadcast_head_seq": int(head),
-            "pending_direct_count": int(pending),
-            "unseen_broadcast_count": int(unseen_broadcast),
-            "has_more": has_more,
-        }
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+            items = []
+            for row in rows:
+                item = self._summary_row(conn, row)
+                item["delivery_kind"] = row["delivery_kind"]
+                items.append(item)
+
+            pending = conn.execute(
+                "SELECT COUNT(*) FROM deliveries WHERE recipient = ? AND state = 'pending'",
+                (recipient,),
+            ).fetchone()[0]
+            head = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM items WHERE is_broadcast = 1"
+            ).fetchone()[0]
+            unseen_broadcast = conn.execute(
+                "SELECT COUNT(*) FROM items i WHERE i.is_broadcast = 1 AND i.seq > ?"
+                " AND i.sender <> ? AND i.status <> 'deleted'"
+                " AND NOT EXISTS(SELECT 1 FROM broadcast_acks a"
+                "                WHERE a.recipient = ? AND a.seq = i.seq)",
+                (cursor_seq, recipient, recipient),
+            ).fetchone()[0]
+            return {
+                "recipient": recipient,
+                "items": items,
+                "broadcast_cursor_seq": cursor_seq,
+                "broadcast_head_seq": int(head),
+                "pending_direct_count": int(pending),
+                "unseen_broadcast_count": int(unseen_broadcast),
+                "has_more": has_more,
+            }
 
     def head_seq(self) -> int:
         row = self.db.query_one("SELECT COALESCE(MAX(seq), 0) AS s FROM items")
@@ -815,6 +936,7 @@ class Repo:
             "SELECT a.label, a.first_seen_ms, a.last_seen_ms, a.sent_count,"
             " (SELECT COUNT(*) FROM deliveries d WHERE d.recipient = a.label"
             "   AND d.state='pending') AS pending"
+            ", a.seen_as"
             " FROM agents a ORDER BY a.last_seen_ms DESC"
         )
         return [
@@ -824,6 +946,7 @@ class Repo:
                 "last_seen": iso(r["last_seen_ms"]),
                 "sent": int(r["sent_count"]),
                 "pending_inbox": int(r["pending"]),
+                "seen_as": r["seen_as"],
             }
             for r in rows
         ]

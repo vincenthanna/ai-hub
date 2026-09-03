@@ -24,7 +24,7 @@ _CJK_RANGES = (
 )
 
 _FTS_SPECIALS = re.compile(r'[\"\'\(\)\*\:\^\{\}\[\]]')
-_TOKEN_RE = re.compile(r'"[^"]*"|\S+')
+_TOKEN_RE = re.compile(r'-?"[^"]*"|\S+')
 
 
 def is_cjk(ch: str) -> bool:
@@ -106,11 +106,18 @@ def build_match_expr(query: str) -> str:
             alts = ['"%s"' % token]
             has_cjk = any(is_cjk(c) for c in token)
             if has_cjk:
+                # A two-character bigram needs a run of at least two syllables;
+                # a single CJK character is already an indexable token.
                 bi = bigrams(token)
-                if bi:
+                if bi and bi != token:
                     alts.append('body_bi : "%s"' % bi)
+                ascii_part = "".join(c for c in token if not is_cjk(c) and c.isalnum())
+                if len(ascii_part) >= 2:
+                    alts.append('"%s"' % ascii_part)
             elif len(token) >= 3 and token.isalnum():
-                alts.append("%s*" % token)
+                # The prefix alternative must stay quoted. Bare AND*/NOT* land
+                # in operator position and make FTS5 reject the whole query.
+                alts.append('"%s"*' % token)
             clause = "(%s)" % " OR ".join(alts)
         if negate:
             negations.append(clause)

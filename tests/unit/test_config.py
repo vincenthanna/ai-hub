@@ -31,9 +31,43 @@ def test_env_overrides_file(tmp_path, monkeypatch):
     assert reread.auth_enabled is False
 
 
-def test_auth_enabled_without_token_generates_one(tmp_path, monkeypatch):
+def test_missing_token_without_create_is_an_error(tmp_path, monkeypatch):
+    """A throwaway token per caller would look fine and 401 everything."""
+    import pytest
+
     monkeypatch.delenv("AIHUB_TOKEN", raising=False)
     path = tmp_path / "server.json"
     path.write_text(json.dumps({"auth_enabled": True, "token": ""}))
-    cfg = load_config(path, create_if_missing=False)
-    assert cfg.token, "auth must never end up enabled with an empty token"
+    with pytest.raises(RuntimeError):
+        load_config(path, create_if_missing=False)
+
+
+def test_token_is_stable_across_reads(tmp_path, monkeypatch):
+    monkeypatch.delenv("AIHUB_TOKEN", raising=False)
+    path = tmp_path / "server.json"
+    first = load_config(path).token
+    second = load_config(path, create_if_missing=False).token
+    assert first == second and first
+
+
+def test_auth_disabled_is_never_persisted(tmp_path, monkeypatch):
+    """AIHUB_AUTH_DISABLED must not latch a public port open."""
+    monkeypatch.delenv("AIHUB_TOKEN", raising=False)
+    monkeypatch.setenv("AIHUB_AUTH_DISABLED", "1")
+    path = tmp_path / "server.json"
+    cfg = load_config(path)
+    assert cfg.auth_enabled is False
+    assert json.loads(path.read_text())["auth_enabled"] is True
+    monkeypatch.delenv("AIHUB_AUTH_DISABLED")
+    assert load_config(path, create_if_missing=False).auth_enabled is True
+
+
+def test_refuses_public_bind_without_auth(tmp_path):
+    import pytest
+
+    from aihub.config import Config, assert_safe_to_serve
+
+    cfg = Config(host="0.0.0.0", auth_enabled=False, token="")
+    with pytest.raises(RuntimeError):
+        assert_safe_to_serve(cfg)
+    assert_safe_to_serve(Config(host="127.0.0.1", auth_enabled=False, token=""))

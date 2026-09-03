@@ -19,9 +19,14 @@ def encode_cursor(payload: Dict[str, Any]) -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
+MAX_CURSOR_CHARS = 512
+
+
 def decode_cursor(cursor: Optional[str]) -> Optional[Dict[str, Any]]:
     if not cursor:
         return None
+    if len(cursor) > MAX_CURSOR_CHARS:
+        raise InvalidRequest("malformed cursor", field="cursor")
     padded = cursor + "=" * (-len(cursor) % 4)
     try:
         raw = base64.urlsafe_b64decode(padded.encode("ascii"))
@@ -29,6 +34,11 @@ def decode_cursor(cursor: Optional[str]) -> Optional[Dict[str, Any]]:
     except Exception:
         raise InvalidRequest("malformed cursor", field="cursor")
     if not isinstance(value, dict):
+        raise InvalidRequest("malformed cursor", field="cursor")
+    seq = value.get("seq")
+    # bool is a subclass of int, and a string seq would make `seq < ?` match
+    # every row under SQLite's type ordering, looping the caller forever.
+    if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
         raise InvalidRequest("malformed cursor", field="cursor")
     return value
 

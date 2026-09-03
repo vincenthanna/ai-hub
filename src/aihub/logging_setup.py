@@ -20,7 +20,7 @@ _RESERVED = {
     "args", "asctime", "created", "exc_info", "exc_text", "filename", "funcName",
     "levelname", "levelno", "lineno", "module", "msecs", "message", "msg", "name",
     "pathname", "process", "processName", "relativeCreated", "stack_info",
-    "thread", "threadName", "taskName",
+    "thread", "threadName", "taskName", "color_message",
 }
 
 

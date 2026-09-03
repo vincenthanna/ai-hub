@@ -167,11 +167,64 @@ def test_broadcast_reaches_everyone_registered_before_it(client):
     assert inbox["items"][0]["delivery_kind"] == "broadcast"
 
 
-def test_new_label_does_not_inherit_old_broadcasts(client):
-    client.post("/v1/items", json=mk(to=None))
+def test_new_label_sees_a_recent_broadcast(client):
+    """The receiving session usually registers *after* the handoff is posted."""
+    up = client.post("/v1/items", json=mk(to=None)).json()
     inbox = client.get("/v1/inbox", params={"as": "brand-new"}).json()
+    assert [i["item_id"] for i in inbox["items"]] == [up["item_id"]]
+
+
+def test_new_label_does_not_inherit_the_whole_backlog(client, repo):
+    """Anything older than the grace window is treated as already seen."""
+    from aihub.ids import now_ms
+    from aihub.storage.repo import NEW_AGENT_GRACE_MS
+
+    up = client.post("/v1/items", json=mk(to=None)).json()
+    with repo.db.write() as conn:
+        conn.execute(
+            "UPDATE items SET created_ms = ? WHERE item_id = ?",
+            (now_ms() - NEW_AGENT_GRACE_MS - 60_000, up["item_id"]),
+        )
+    inbox = client.get("/v1/inbox", params={"as": "late-comer"}).json()
     assert inbox["items"] == []
     assert inbox["unseen_broadcast_count"] == 0
+
+
+def test_acking_one_broadcast_keeps_the_others_unread(client):
+    """A scalar watermark alone would silently drop the two unread items."""
+    client.get("/v1/inbox", params={"as": "reader2"})
+    a = client.post("/v1/items", json=mk(title="첫째", to=None)).json()
+    b = client.post("/v1/items", json=mk(title="둘째", to=None)).json()
+    c = client.post("/v1/items", json=mk(title="셋째", to=None)).json()
+
+    client.post("/v1/inbox/ack", json={"as": "reader2", "item_ids": [c["item_id"]]})
+    left = [i["item_id"] for i in client.get("/v1/inbox", params={"as": "reader2"}).json()["items"]]
+    assert left == [a["item_id"], b["item_id"]]
+
+    client.post("/v1/inbox/ack", json={"as": "reader2", "item_ids": [a["item_id"], b["item_id"]]})
+    assert client.get("/v1/inbox", params={"as": "reader2"}).json()["items"] == []
+
+
+def test_broadcast_ack_is_idempotent(client):
+    client.get("/v1/inbox", params={"as": "reader3"})
+    up = client.post("/v1/items", json=mk(to=None)).json()
+    first = client.post(
+        "/v1/inbox/ack", json={"as": "reader3", "item_ids": [up["item_id"]]}
+    ).json()
+    second = client.post(
+        "/v1/inbox/ack", json={"as": "reader3", "item_ids": [up["item_id"]]}
+    ).json()
+    assert first["acked"] == 1
+    assert second["acked"] == 0 and second["already_acked"] == 1
+
+
+def test_unknown_recipient_is_reported_back(client):
+    """A typo in --to would otherwise be a silent 201 that nobody receives."""
+    r = client.post("/v1/items", json=mk(to=["never-polled-label"]))
+    assert r.status_code == 201
+    # the label is registered so the message is not lost, but flagged as unseen
+    agents = {a["label"]: a for a in client.get("/v1/agents").json()["agents"]}
+    assert agents["never-polled-label"]["seen_as"] == "addressed"
 
 
 def test_sender_does_not_receive_own_broadcast(client):

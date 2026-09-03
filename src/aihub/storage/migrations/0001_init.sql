@@ -66,7 +66,9 @@ CREATE INDEX idx_items_kind           ON items(kind, seq DESC);
 CREATE INDEX idx_items_broadcast      ON items(is_broadcast, seq);
 CREATE INDEX idx_items_needs_class    ON items(classification_status, seq)
                                       WHERE classification_status IN ('pending','failed');
-CREATE UNIQUE INDEX idx_items_client_msg ON items(client_msg_id)
+-- Scoped by sender: a global unique key would let one agent receive another
+-- agent's item_id (and therefore read its body) by reusing the same key.
+CREATE UNIQUE INDEX idx_items_client_msg ON items(sender, client_msg_id)
                                       WHERE client_msg_id IS NOT NULL;
 
 CREATE TABLE item_bodies (
@@ -108,7 +110,11 @@ CREATE TABLE agents (
   label         TEXT PRIMARY KEY,
   first_seen_ms INTEGER NOT NULL,
   last_seen_ms  INTEGER NOT NULL,
-  sent_count    INTEGER NOT NULL DEFAULT 0
+  sent_count    INTEGER NOT NULL DEFAULT 0,
+  -- 'sender' means a real session has used this label; 'addressed' means it has
+  -- only ever appeared in someone's `to` field and may well be a typo.
+  seen_as       TEXT    NOT NULL DEFAULT 'sender'
+                        CHECK (seen_as IN ('sender','addressed'))
 );
 
 -- Direct (addressed) delivery state. One row per (item, recipient).
@@ -125,11 +131,22 @@ CREATE TABLE deliveries (
 );
 CREATE INDEX idx_deliveries_pending ON deliveries(recipient, state, seq);
 
--- Broadcast watermark. A recipient sees broadcast items with seq > broadcast_seq.
+-- Broadcast watermark: everything at or below broadcast_seq is acknowledged.
 CREATE TABLE agent_cursors (
   recipient     TEXT    PRIMARY KEY,
   broadcast_seq INTEGER NOT NULL DEFAULT 0,
   updated_ms    INTEGER NOT NULL
+);
+
+-- Individual acknowledgements above the watermark. A scalar cursor alone cannot
+-- express "102 handled, 100 and 101 not yet": advancing it would drop the two
+-- unread items, and not advancing it would resurface 102 forever. Contiguous
+-- runs are folded into the watermark and deleted from here.
+CREATE TABLE broadcast_acks (
+  recipient TEXT    NOT NULL,
+  seq       INTEGER NOT NULL,
+  acked_ms  INTEGER NOT NULL,
+  PRIMARY KEY (recipient, seq)
 );
 
 CREATE TABLE classification_jobs (

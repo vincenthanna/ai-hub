@@ -56,7 +56,7 @@ def repo(config):
     from aihub.storage.repo import Repo
 
     db = Database(config.db_path)
-    migrate(db._writer)
+    migrate(db.writer)
     blobs = BlobStore(config.blobs_dir)
     yield Repo(db, blobs)
     db.close()

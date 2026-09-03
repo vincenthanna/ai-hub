@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "threshold": 2.0,
+  "topics": [
+    {"id": "infra-deploy", "display": "Infra & Deploy", "weight": 1.0,
+     "keywords": ["배포", "deploy", "systemd", "ssh", "nginx", "docker", "uv", "port", "포트",
+                  "방화벽", "ufw", "서버", "server", "restart", "재시작", "cron", "환경변수", "env"]},
+    {"id": "build-ci", "display": "Build & CI", "weight": 1.0,
+     "keywords": ["build", "빌드", "ci", "pipeline", "github action", "workflow", "make",
+                  "compile", "컴파일", "lint", "pytest", "테스트 실패", "test failure"]},
+    {"id": "db-storage", "display": "Database & Storage", "weight": 1.0,
+     "keywords": ["sqlite", "postgres", "mysql", "schema", "스키마", "migration", "마이그레이션",
+                  "index", "인덱스", "쿼리", "query", "테이블", "table", "transaction"]},
+    {"id": "api-backend", "display": "API & Backend", "weight": 1.0,
+     "keywords": ["api", "endpoint", "rest", "graphql", "fastapi", "flask", "django",
+                  "http", "request", "response", "라우터", "router", "핸들러"]},
+    {"id": "frontend-ui", "display": "Frontend & UI", "weight": 1.0,
+     "keywords": ["react", "vue", "css", "html", "component", "컴포넌트", "레이아웃",
+                  "브라우저", "browser", "ui", "화면", "렌더", "render", "typescript"]},
+    {"id": "auth-security", "display": "Auth & Security", "weight": 1.0,
+     "keywords": ["auth", "인증", "토큰", "token", "oauth", "jwt", "권한", "permission",
+                  "login", "로그인", "session", "세션", "취약점", "vulnerability", "보안"]},
+    {"id": "perf", "display": "Performance", "weight": 1.0,
+     "keywords": ["성능", "performance", "느림", "slow", "latency", "지연", "profil",
+                  "메모리누수", "memory leak", "최적화", "optimize", "bottleneck", "병목"]},
+    {"id": "ml-model", "display": "ML & Models", "weight": 1.0,
+     "keywords": ["모델", "model", "training", "학습", "inference", "추론", "dataset",
+                  "데이터셋", "onnx", "quantiz", "양자화", "yolo", "torch", "accuracy"]},
+    {"id": "handoff", "display": "Session Handoff", "weight": 1.2,
+     "keywords": ["인수인계", "handoff", "이어받", "넘겨", "take over", "continue this",
+                  "다음 세션", "next session", "진행 상황", "progress"]},
+    {"id": "docs", "display": "Docs & Notes", "weight": 0.8,
+     "keywords": ["문서", "docs", "readme", "정리", "메모", "note", "가이드", "guide"]}
+  ],
+  "kind_rules": [
+    {"match": ["traceback (most recent call last)", "exception", "에러", "error:",
+               "failed", "실패", "stack trace"], "kind": "issue", "importance": 4},
+    {"match": ["인수인계", "handoff", "이어받", "take over"], "kind": "handoff", "importance": 4},
+    {"match": ["결정", "decision", "정했", "채택"], "kind": "decision", "importance": 3}
+  ],
+  "importance_rules": [
+    {"match": ["긴급", "critical", "urgent", "장애", "outage", "prod ", "production"],
+     "importance": 5}
+  ],
+  "tag_rules": [
+    {"match": ["traceback (most recent call last)"], "tag": "python-error"},
+    {"match": ["segmentation fault", "segfault"], "tag": "crash"},
+    {"match": ["timeout", "타임아웃"], "tag": "timeout"},
+    {"match": ["permission denied", "권한 거부"], "tag": "permissions"},
+    {"match": ["connection refused", "connection reset"], "tag": "network"},
+    {"match": ["out of memory", "oom", "메모리 부족"], "tag": "oom"}
+  ]
+}

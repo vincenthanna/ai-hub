@@ -171,15 +171,39 @@ def load_config(path: Path | None = None, *, create_if_missing: bool = True) -> 
     if os.environ.get("AIHUB_CLASSIFY_MODEL"):
         cfg.classify.model = os.environ["AIHUB_CLASSIFY_MODEL"]
 
-    if cfg.auth_enabled and not cfg.token:
+    # A token is minted and persisted regardless of auth_enabled: the file always
+    # records auth as enabled, so a run with auth off must not leave it tokenless.
+    if not cfg.token:
+        if not create_if_missing:
+            # Minting a throwaway token here would hand every caller a different
+            # secret and turn a missing config into a silent wall of 401s.
+            raise RuntimeError(
+                "no auth token in %s. Run scripts/install.sh (or "
+                "python -m aihub.admin init) to create one." % cfg_path
+            )
         cfg.token = secrets.token_urlsafe(32)
-        if create_if_missing:
-            write_config(cfg)
+        write_config(cfg)
 
     if create_if_missing and not cfg_path.is_file():
         write_config(cfg)
 
     return cfg
+
+
+def assert_safe_to_serve(cfg: "Config") -> None:
+    """Refuse to listen on a non-loopback address without authentication.
+
+    AIHUB_AUTH_DISABLED is a volatile debugging switch; it is never written to
+    the config file, so it cannot silently latch a public port open.
+    """
+    if cfg.auth_enabled:
+        return
+    loopback = cfg.host in ("127.0.0.1", "::1", "localhost")
+    if not loopback:
+        raise RuntimeError(
+            "auth is disabled but the server would bind %s. Refusing to start. "
+            "Bind 127.0.0.1 for local debugging, or leave auth enabled." % cfg.host
+        )
 
 
 def write_config(cfg: Config) -> None:
@@ -189,7 +213,9 @@ def write_config(cfg: Config) -> None:
         "host": cfg.host,
         "port": cfg.port,
         "token": cfg.token,
-        "auth_enabled": cfg.auth_enabled,
+        # Always persist true: disabling auth is a volatile env-only override so
+        # a one-off debugging run cannot leave the server permanently open.
+        "auth_enabled": True,
         "home": str(cfg.home),
         "max_body_bytes": cfg.max_body_bytes,
         "max_file_bytes": cfg.max_file_bytes,
@@ -209,6 +235,9 @@ def write_config(cfg: Config) -> None:
         },
     }
     tmp = cfg.config_path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
+    # Create with 0600 rather than chmod after writing: otherwise the token
+    # exists world-readable for the moment between the two calls.
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
     os.replace(tmp, cfg.config_path)

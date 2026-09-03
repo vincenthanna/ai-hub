@@ -113,6 +113,7 @@ _STATUS_CODES = {
     404: "not_found",
     405: "method_not_allowed",
     409: "conflict",
+    422: "validation_failed",
     413: "payload_too_large",
     415: "unsupported_media_type",
     429: "rate_limited",
@@ -132,7 +133,12 @@ async def http_error_handler(request: Request, exc: StarletteHTTPException) -> J
 async def validation_error_handler(
     request: Request, exc: RequestValidationError
 ) -> JSONResponse:
-    errors = jsonable_encoder(exc.errors())
+    # Pydantic includes the offending input value; echoing it back would put
+    # request bodies into logs and responses.
+    errors = [
+        {k: v for k, v in item.items() if k != "input"}
+        for item in jsonable_encoder(exc.errors())
+    ]
     first_field = None
     if errors:
         loc = errors[0].get("loc") or []

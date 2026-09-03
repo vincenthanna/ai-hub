@@ -19,7 +19,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     cfg.ensure_dirs()
     write_config(cfg)
     db = Database(cfg.db_path)
-    version = migrate(db._writer)
+    version = migrate(db.writer)
     db.close()
     BlobStore(cfg.blobs_dir)
     print("home          : %s" % cfg.home)
@@ -38,8 +38,8 @@ def cmd_token(args: argparse.Namespace) -> int:
 def cmd_migrate(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     db = Database(cfg.db_path)
-    before = current_version(db._writer)
-    after = migrate(db._writer)
+    before = current_version(db.writer)
+    after = migrate(db.writer)
     db.close()
     print("schema %d -> %d" % (before, after))
     return 0
@@ -49,8 +49,15 @@ def cmd_stats(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     db = Database(cfg.db_path)
     blobs = BlobStore(cfg.blobs_dir)
-    conn = db.reader()
-    out = {
+    with db.read() as conn:
+        out = _stats_snapshot(conn, cfg, blobs)
+    db.close()
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+    return 0
+
+
+def _stats_snapshot(conn, cfg, blobs):
+    return {
         "items": conn.execute("SELECT COUNT(*) FROM items").fetchone()[0],
         "topics": conn.execute(
             "SELECT COUNT(*) FROM topics WHERE status <> 'deprecated'"
@@ -71,9 +78,6 @@ def cmd_stats(args: argparse.Namespace) -> int:
         "blob_bytes": blobs.total_bytes(),
         "free_bytes": blobs.free_bytes(),
     }
-    db.close()
-    print(json.dumps(out, indent=2, ensure_ascii=False))
-    return 0
 
 
 def cmd_gc(args: argparse.Namespace) -> int:
@@ -81,12 +85,14 @@ def cmd_gc(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     db = Database(cfg.db_path)
     blobs = BlobStore(cfg.blobs_dir)
-    conn = db.reader()
-    referenced = {r[0] for r in conn.execute("SELECT rel_path FROM attachments")}
-    referenced |= {
-        r[0]
-        for r in conn.execute("SELECT rel_path FROM item_bodies WHERE rel_path IS NOT NULL")
-    }
+    with db.read() as conn:
+        referenced = {r[0] for r in conn.execute("SELECT rel_path FROM attachments").fetchall()}
+        referenced |= {
+            r[0]
+            for r in conn.execute(
+                "SELECT rel_path FROM item_bodies WHERE rel_path IS NOT NULL"
+            ).fetchall()
+        }
     removed = 0
     freed = 0
     import os
@@ -125,7 +131,7 @@ def cmd_reclassify(args: argparse.Namespace) -> int:
 
     cfg = load_config(args.config)
     db = Database(cfg.db_path)
-    conn = db._writer
+    conn = db.writer
     where = "1=1"
     params: List[object] = []
     if args.item:
