@@ -1,8 +1,9 @@
 """Shared-secret authentication.
 
-Every endpoint except ``GET /health`` requires the ``X-AIHub-Token`` header.
-Comparison uses ``hmac.compare_digest`` so a wrong token cannot be recovered by
-timing the response.
+The ASGI middleware in ``app.py`` is what actually gates requests, ahead of any
+body buffering. This dependency stays as a second layer so a router mounted
+outside the middleware still refuses anonymous callers. Comparison uses
+``hmac.compare_digest`` so a wrong token cannot be recovered by timing.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import hmac
 
 from fastapi import Request
 
+from .config import accepted_tokens
 from .errors import Unauthorized
 
 HEADER_NAME = "X-AIHub-Token"
@@ -25,8 +27,15 @@ def check_token(request: Request) -> None:
         auth = request.headers.get("Authorization") or ""
         if auth.lower().startswith("bearer "):
             supplied = auth[7:].strip()
-    if not supplied or not hmac.compare_digest(supplied, cfg.token):
-        raise Unauthorized("missing or invalid %s" % HEADER_NAME)
+    for candidate in accepted_tokens(cfg):
+        try:
+            if supplied and hmac.compare_digest(supplied, candidate):
+                return
+        except TypeError:
+            # compare_digest rejects non-ASCII str; a bad header must be a 401,
+            # not a 500 with a stack trace in the log for every attempt.
+            break
+    raise Unauthorized("missing or invalid %s" % HEADER_NAME)
 
 
 async def require_token(request: Request) -> None:
