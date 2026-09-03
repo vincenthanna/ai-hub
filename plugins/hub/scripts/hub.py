@@ -24,7 +24,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 DEFAULT_URL = "http://192.168.49.48:16001"
 USER_CONFIG = Path(
     os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
@@ -776,9 +776,24 @@ if [ -z "$CB" ]; then echo "PREFLIGHT_FAIL: claude CLI not found on this host"; 
 command -v python3 >/dev/null 2>&1 || { echo "PREFLIGHT_FAIL: python3 not found"; exit 11; }
 echo "claude: $CB"
 echo "python3: $(command -v python3) ($(python3 -V 2>&1))"
-"$CB" plugin marketplace add __SOURCE__ --sparse .claude-plugin plugins 2>&1 | tail -3 || \
-  "$CB" plugin marketplace update __MARKETPLACE__ 2>&1 | tail -2
-"$CB" plugin install __PLUGIN__ --yes 2>&1 | tail -3
+# Add plainly rather than with --sparse: --sparse is part of the declared source
+# shape, so using it here collides with an existing plain declaration on a host
+# that already knows this marketplace.
+ADD_OUT="$("$CB" plugin marketplace add __SOURCE__ 2>&1 || true)"
+case "$ADD_OUT" in
+  *"Successfully added"*) echo "marketplace: added" ;;
+  *already*|*differs*|*"already exists"*)
+      echo "marketplace: already declared, refreshing"
+      "$CB" plugin marketplace update __MARKETPLACE__ >/dev/null 2>&1 || true ;;
+  *)  echo "marketplace: add reported:"; printf '%s\n' "$ADD_OUT" | tail -3
+      "$CB" plugin marketplace update __MARKETPLACE__ >/dev/null 2>&1 || true ;;
+esac
+INS_OUT="$("$CB" plugin install __PLUGIN__ --yes 2>&1 || true)"
+case "$INS_OUT" in
+  *"already installed"*) echo "plugin: already installed, updating"
+      "$CB" plugin update __PLUGIN__ 2>&1 | tail -1 ;;
+  *) printf '%s\n' "$INS_OUT" | tail -2 ;;
+esac
 HUBPY="$(ls -d "$HOME"/.claude/plugins/cache/__MARKETPLACE__/hub/*/scripts/hub.py 2>/dev/null | tail -1)"
 [ -n "$HUBPY" ] || { echo "PREFLIGHT_FAIL: installed hub.py not found"; exit 12; }
 echo "client: $HUBPY"
