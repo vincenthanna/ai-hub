@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__
-from .config import Config, assert_safe_to_serve, load_config
+from .config import Config, accepted_tokens, assert_safe_to_serve, load_config
 from .errors import (
     AIHubError,
     PayloadTooLarge,
@@ -77,10 +77,14 @@ class GateMiddleware:
                 supplied = auth[7:].strip()
         if not supplied:
             return False
-        try:
-            return hmac.compare_digest(supplied, self.config.token)
-        except TypeError:
-            return False
+        for candidate in accepted_tokens(self.config):
+            try:
+                if hmac.compare_digest(supplied, candidate):
+                    return True
+            except TypeError:
+                # A non-ASCII header would otherwise raise and become a 500.
+                return False
+        return False
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -172,6 +176,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("storage closed")
 
 
+def _stdout_logging() -> bool:
+    return (os.environ.get("AIHUB_LOG_STDOUT") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _docs_enabled() -> bool:
     return (os.environ.get("AIHUB_DOCS") or "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -180,7 +188,10 @@ def create_app(config: Optional[Config] = None) -> FastAPI:
     cfg = config or load_config()
     assert_safe_to_serve(cfg)
     cfg.ensure_dirs()
-    setup_logging(cfg.logs_dir, cfg.log_level)
+    # stdout is redirected into a separate file by the start script; writing
+    # both there and to the rotating handler would double every line and
+    # strand later output in an already-rotated inode.
+    setup_logging(cfg.logs_dir, cfg.log_level, to_stdout=_stdout_logging())
 
     app = FastAPI(
         title="ai-hub",

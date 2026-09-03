@@ -47,9 +47,10 @@ class ClassifyConfig:
     max_attempts: int = 3
     claude_bin: str = "claude"
     model: str = "claude-haiku-4-5-20251001"
-    batch_size: int = 8
+    batch_size: int = 4
     batch_wait_sec: float = 5.0
     max_topics_in_prompt: int = 40
+    max_calls_per_day: int = 200
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "ClassifyConfig":
@@ -64,6 +65,7 @@ class ClassifyConfig:
             "batch_size",
             "batch_wait_sec",
             "max_topics_in_prompt",
+            "max_calls_per_day",
         ):
             if key in raw and raw[key] is not None:
                 setattr(base, key, raw[key])
@@ -75,6 +77,10 @@ class Config:
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     token: str = ""
+    # Accepted alongside `token` until it expires, so a rotation does not have to
+    # reach every client in the same instant.
+    token_previous: str = ""
+    token_previous_until_ms: int = 0
     auth_enabled: bool = True
     home: Path = field(default_factory=_default_home)
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES
@@ -139,6 +145,10 @@ def load_config(path: Path | None = None, *, create_if_missing: bool = True) -> 
         cfg.port = int(raw["port"])
     if "token" in raw:
         cfg.token = str(raw["token"])
+    if "token_previous" in raw:
+        cfg.token_previous = str(raw["token_previous"] or "")
+    if "token_previous_until_ms" in raw:
+        cfg.token_previous_until_ms = int(raw["token_previous_until_ms"] or 0)
     if "auth_enabled" in raw:
         cfg.auth_enabled = bool(raw["auth_enabled"])
     if raw.get("home"):
@@ -190,6 +200,16 @@ def load_config(path: Path | None = None, *, create_if_missing: bool = True) -> 
     return cfg
 
 
+def accepted_tokens(cfg: "Config") -> list:
+    """Tokens that authenticate right now, newest first."""
+    import time as _time
+
+    out = [cfg.token]
+    if cfg.token_previous and _time.time() * 1000 < cfg.token_previous_until_ms:
+        out.append(cfg.token_previous)
+    return [t for t in out if t]
+
+
 def assert_safe_to_serve(cfg: "Config") -> None:
     """Refuse to listen on a non-loopback address without authentication.
 
@@ -213,6 +233,8 @@ def write_config(cfg: Config) -> None:
         "host": cfg.host,
         "port": cfg.port,
         "token": cfg.token,
+        "token_previous": cfg.token_previous,
+        "token_previous_until_ms": cfg.token_previous_until_ms,
         # Always persist true: disabling auth is a volatile env-only override so
         # a one-off debugging run cannot leave the server permanently open.
         "auth_enabled": True,
@@ -232,6 +254,7 @@ def write_config(cfg: Config) -> None:
             "batch_size": cfg.classify.batch_size,
             "batch_wait_sec": cfg.classify.batch_wait_sec,
             "max_topics_in_prompt": cfg.classify.max_topics_in_prompt,
+            "max_calls_per_day": cfg.classify.max_calls_per_day,
         },
     }
     tmp = cfg.config_path.with_suffix(".json.tmp")

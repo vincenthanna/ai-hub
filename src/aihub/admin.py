@@ -6,6 +6,7 @@ import argparse
 import json
 import sqlite3
 import sys
+from pathlib import Path
 from typing import List, Optional
 
 from .config import load_config, write_config
@@ -164,6 +165,89 @@ def cmd_reclassify(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_backup(args: argparse.Namespace) -> int:
+    """Snapshot the database. Copying the file is unsafe while WAL is active."""
+    import time
+
+    cfg = load_config(args.config)
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    target = Path(args.out) if args.out else cfg.home / "backups" / ("aihub-%s.sqlite3" % stamp)
+    db = Database(cfg.db_path)
+    db.backup_to(target)
+    db.close()
+    keep = max(1, args.keep)
+    backups = sorted((cfg.home / "backups").glob("aihub-*.sqlite3"))
+    for stale in backups[:-keep]:
+        stale.unlink(missing_ok=True)
+    print("backup written to %s (%d bytes); keeping %d" % (target, target.stat().st_size, keep))
+    return 0
+
+
+def cmd_rotate_token(args: argparse.Namespace) -> int:
+    """Issue a new token while the old one keeps working for a grace period."""
+    import secrets
+    import time
+
+    from .config import write_config
+
+    cfg = load_config(args.config)
+    cfg.token_previous = cfg.token
+    cfg.token_previous_until_ms = int(time.time() * 1000) + args.grace_hours * 3600 * 1000
+    cfg.token = secrets.token_urlsafe(32)
+    write_config(cfg)
+    print("new token written to %s" % cfg.config_path)
+    print("the previous token keeps working for %d hour(s)" % args.grace_hours)
+    print("restart the server, then update each client with:")
+    print("  hub.py init --token <new token>")
+    return 0
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    """Integrity check, for use before and after a migration."""
+    cfg = load_config(args.config)
+    db = Database(cfg.db_path)
+    with db.read() as conn:
+        integrity = conn.execute("PRAGMA quick_check").fetchone()[0]
+        fk = conn.execute("PRAGMA foreign_key_check").fetchall()
+        items = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+        fts = conn.execute("SELECT COUNT(*) FROM items_fts").fetchone()[0]
+    db.close()
+    ok = integrity == "ok" and not fk and items == fts
+    print("quick_check      : %s" % integrity)
+    print("foreign_key_check: %d violation(s)" % len(fk))
+    print("items vs fts     : %d vs %d%s" % (items, fts, "" if items == fts else "  MISMATCH"))
+    if items != fts:
+        print("run 'python -m aihub.admin reindex' to rebuild the search index")
+    return 0 if ok else 1
+
+
+def cmd_reindex(args: argparse.Namespace) -> int:
+    from .storage.repo import Repo
+
+    cfg = load_config(args.config)
+    db = Database(cfg.db_path)
+    repo = Repo(db, BlobStore(cfg.blobs_dir))
+    with db.read() as conn:
+        rows = conn.execute("SELECT seq, item_id, title, summary FROM items").fetchall()
+    count = 0
+    for row in rows:
+        body = repo.read_body(row["item_id"])
+        with db.read() as conn:
+            tags = [
+                r["tag_id"]
+                for r in conn.execute(
+                    "SELECT tag_id FROM item_tags WHERE item_id = ?", (row["item_id"],)
+                ).fetchall()
+            ]
+        with db.write() as conn:
+            repo._fts_write(conn, int(row["seq"]), row["title"], row["summary"], body, tags)
+        count += 1
+    db.optimize()
+    db.close()
+    print("reindexed %d item(s)" % count)
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="aihub.admin")
     parser.add_argument("--config", default=None)
@@ -181,6 +265,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     rc.add_argument("--failed", action="store_true")
     rc.add_argument("--limit", type=int, default=200)
     rc.set_defaults(func=cmd_reclassify)
+    bk = sub.add_parser("backup")
+    bk.add_argument("--out")
+    bk.add_argument("--keep", type=int, default=7)
+    bk.set_defaults(func=cmd_backup)
+    rt = sub.add_parser("rotate-token")
+    rt.add_argument("--grace-hours", type=int, default=24)
+    rt.set_defaults(func=cmd_rotate_token)
+    sub.add_parser("verify").set_defaults(func=cmd_verify)
+    sub.add_parser("reindex").set_defaults(func=cmd_reindex)
     args = parser.parse_args(argv)
     return args.func(args)
 

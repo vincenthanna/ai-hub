@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from .config import load_config
@@ -33,19 +34,35 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg.ensure_dirs()
 
+    # Written by the server itself. `$!` in the start script captures the uv
+    # wrapper's pid; SIGKILLing that leaves the real server holding the port.
+    try:
+        cfg.pid_file.write_text("%d\n" % os.getpid(), encoding="utf-8")
+    except OSError:
+        pass
+
     import uvicorn
 
     from .app import create_app
 
-    uvicorn.run(
-        create_app(cfg),
-        host=cfg.host,
-        port=cfg.port,
-        workers=1,
-        access_log=False,
-        timeout_graceful_shutdown=20,
-        log_config=None,
-    )
+    try:
+        uvicorn.run(
+            create_app(cfg),
+            host=cfg.host,
+            port=cfg.port,
+            workers=1,
+            access_log=False,
+            timeout_graceful_shutdown=20,
+            # Leave the JSON-line handlers alone; uvicorn's dictConfig would
+            # disable existing loggers and replace the formatter.
+            log_config=None,
+        )
+    finally:
+        try:
+            if cfg.pid_file.is_file() and cfg.pid_file.read_text().strip() == str(os.getpid()):
+                cfg.pid_file.unlink()
+        except OSError:
+            pass
     return 0
 
 

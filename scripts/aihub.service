@@ -1,0 +1,24 @@
+# systemd --user unit. Install with scripts/install-service.sh.
+# Linger must be enabled for the account (loginctl show-user "$USER" | grep Linger)
+# or the service dies when the last session ends.
+[Unit]
+Description=ai-hub cross-session message hub
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/workspace/ai-hub
+Environment=AIHUB_HOME=%h/.local/share/ai-hub
+Environment=AIHUB_CONFIG=%h/.config/ai-hub/server.json
+# /snap/bin must stay on PATH: on ds30 uv lives there.
+Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+ExecStart=__UV__ run --frozen python -m aihub
+Restart=always
+RestartSec=5
+# Long-poll clients each hold a connection; the default 1024 runs out early.
+LimitNOFILE=8192
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

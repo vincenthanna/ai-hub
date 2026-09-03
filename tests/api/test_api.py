@@ -24,12 +24,20 @@ def mk(**over):
 
 
 # ---------------------------------------------------------------- auth
-def test_health_needs_no_token(client):
+def test_health_needs_no_token_and_says_nothing_else(client):
+    """An open port should not advertise item counts or whether auth is on."""
     client.headers.pop("X-AIHub-Token", None)
     r = client.get("/health")
     assert r.status_code == 200
-    assert r.json()["status"] == "ok"
-    assert r.json()["auth_enabled"] is True
+    assert r.json() == {"status": "ok"}
+
+
+def test_health_with_token_returns_detail(client):
+    body = client.get("/health").json()
+    assert body["status"] == "ok"
+    assert body["auth_enabled"] is True
+    assert body["db"]["journal_mode"] == "wal"
+    assert body["schema_version"] >= 1
 
 
 def test_missing_token_is_401_with_envelope(client):
@@ -367,3 +375,31 @@ def test_large_body_goes_to_blob_and_round_trips(client):
     assert r.status_code == 201
     detail = client.get("/v1/items/%s" % r.json()["item_id"]).json()
     assert detail["body"] == big[: 250_000]
+
+
+def test_attachment_is_never_served_as_html(client):
+    """An .html attachment served inline would execute on the hub's origin."""
+    html = b"<script>alert(1)</script>"
+    r = client.post(
+        "/v1/items",
+        data={"payload": json.dumps(mk())},
+        files=[("files", ("evil.html", io.BytesIO(html), "text/html"))],
+    )
+    att = r.json()["attachments"][0]
+    got = client.get(att["download_url"])
+    assert got.status_code == 200
+    assert got.headers["content-type"] == "application/octet-stream"
+    assert got.headers["X-Content-Type-Options"] == "nosniff"
+    assert got.headers["content-disposition"].startswith("attachment;")
+    assert got.content == html
+
+
+def test_attachment_filename_is_sanitized(client):
+    r = client.post(
+        "/v1/items",
+        data={"payload": json.dumps(mk())},
+        files=[("files", ('a"; drop\n.txt', io.BytesIO(b"x"), "text/plain"))],
+    )
+    att = r.json()["attachments"][0]
+    disposition = client.get(att["download_url"]).headers["content-disposition"]
+    assert "\n" not in disposition and disposition.count('"') == 2

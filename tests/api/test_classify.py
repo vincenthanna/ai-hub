@@ -164,7 +164,8 @@ def test_batch_result_mismatch_does_not_cross_assign(config, monkeypatch):
 
     # Only ref 1 comes back, and it names a topic that belongs to item b.
     async def fake_batch(items, topics, tags, **kw):
-        return [{"ref": 1, "topic_id": "auth-security", "topic_action": "existing",
+        return [{"ref": 1, "check": b["item_id"][:8],
+                 "topic_id": "auth-security", "topic_action": "existing",
                  "topic_confidence": 0.9, "tags": ["oauth"], "summary": "인증 이슈",
                  "importance": 3, "kind": "issue"}]
 
@@ -190,4 +191,84 @@ def test_batch_result_mismatch_does_not_cross_assign(config, monkeypatch):
     # item a had no result, so it must be classified by rules, not by b's answer
     assert got_a["classification"] == "heuristic", got_a
     assert got_a["topic"] != "auth-security"
+    db.close()
+
+
+def test_mismatched_check_value_is_discarded(config, monkeypatch):
+    """A reordered response must not attach one item's topic to another."""
+    import asyncio
+
+    from aihub.classify import worker as worker_mod
+    from aihub.storage.blobs import BlobStore
+    from aihub.storage.db import Database
+    from aihub.storage.migrate import migrate
+    from aihub.storage.repo import Repo
+
+    db = Database(config.db_path)
+    migrate(db.writer)
+    repo = Repo(db, BlobStore(config.blobs_dir))
+
+    class FakeApp:
+        class state:
+            pass
+
+    app = FakeApp()
+    app.state.config = config
+    app.state.db = db
+    app.state.repo = repo
+    w = worker_mod.ClassifyWorker(app)
+    w.engine = "claude"
+    w._seed_topics()
+
+    item, _ = repo.create_item(sender="s", to=[], kind="note", title="배포 이슈",
+                               body="systemd uv PATH 포트", topic=None, tags=[])
+
+    async def fake_batch(items, topics, tags, **kw):
+        # right ref, wrong check: this is the cross-assignment failure mode
+        return [{"ref": 0, "check": "DEADBEEF", "topic_id": "auth-security",
+                 "topic_action": "existing", "topic_confidence": 0.9,
+                 "tags": ["oauth"], "summary": "엉뚱한 요약", "importance": 3,
+                 "kind": "issue"}]
+
+    monkeypatch.setattr(worker_mod, "classify_batch", fake_batch)
+    job = {"job_id": "j1", "item_id": item["item_id"], "attempt": 0, "max_attempts": 2,
+           "title": item["title"], "body": "systemd uv PATH 포트"}
+    db.writer.execute(
+        "INSERT INTO classification_jobs(job_id,item_id,input_hash,state,next_run_ms,created_ms)"
+        " VALUES(?,?,?, 'running', 0, 0)", (job["job_id"], job["item_id"], job["job_id"]))
+    asyncio.run(w._process([job]))
+
+    got = repo.get_item(item["item_id"])
+    assert got["classification"] == "heuristic"
+    assert got["topic"] != "auth-security"
+    assert got["summary"] != "엉뚱한 요약"
+    db.close()
+
+
+def test_daily_call_budget_falls_back_to_rules(config):
+    from aihub.classify import worker as worker_mod
+    from aihub.storage.blobs import BlobStore
+    from aihub.storage.db import Database
+    from aihub.storage.migrate import migrate
+    from aihub.storage.repo import Repo
+
+    db = Database(config.db_path)
+    migrate(db.writer)
+
+    class FakeApp:
+        class state:
+            pass
+
+    app = FakeApp()
+    app.state.config = config
+    app.state.db = db
+    app.state.repo = Repo(db, BlobStore(config.blobs_dir))
+    w = worker_mod.ClassifyWorker(app)
+    w.engine = "claude"
+    config.classify.max_calls_per_day = 2
+    assert w._claude_usable() is True
+    w._spend_call()
+    w._spend_call()
+    assert w._budget_left() == 0
+    assert w._claude_usable() is False, "budget exhaustion must not keep calling claude"
     db.close()

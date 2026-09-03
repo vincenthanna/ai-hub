@@ -292,10 +292,15 @@ def cmd_ping(cfg: Config, args: argparse.Namespace) -> int:
     started = time.perf_counter()
     data = _request(cfg, "GET", "/health", retries=1)
     latency = (time.perf_counter() - started) * 1000
+    # /health is deliberately unauthenticated, so reaching it proves only that
+    # the server is up. Touch one authenticated endpoint as well, otherwise a
+    # wrong token reports "ok" and the real failure surfaces much later.
+    _request(cfg, "GET", "/v1/agents", retries=1)
     if args.json:
-        emit_json({"ok": True, "server": cfg.url, "latency_ms": round(latency, 1), "health": data})
+        emit_json({"ok": True, "server": cfg.url, "latency_ms": round(latency, 1),
+                   "auth": "ok", "health": data})
     else:
-        out("ok %s %.0fms  status=%s items=%s classifier=%s"
+        out("ok %s %.0fms  auth=ok status=%s items=%s classifier=%s"
             % (cfg.url, latency, data.get("status"),
                (data.get("db") or {}).get("items"),
                (data.get("classifier") or {}).get("engine")))
@@ -390,8 +395,13 @@ def cmd_send(cfg: Config, args: argparse.Namespace) -> int:
 
 
 def cmd_inbox(cfg: Config, args: argparse.Namespace) -> int:
+    if getattr(args, "unread_banner", False):
+        # Session-start path: a short timeout and no retries, so an unreachable
+        # hub costs the session a moment rather than the full retry budget.
+        cfg.timeout = min(cfg.timeout, 3.0)
     data = _request(
         cfg, "GET", "/v1/inbox",
+        retries=1 if getattr(args, "unread_banner", False) else 3,
         params={
             "as": cfg.label,
             "limit": args.limit,
@@ -400,7 +410,7 @@ def cmd_inbox(cfg: Config, args: argparse.Namespace) -> int:
             "wait_sec": args.wait,
         },
     )
-    if args.on_session_start:
+    if args.unread_banner:
         # Quiet unless the user opted in and something is actually waiting.
         if not cfg.auto_inbox or not data["items"]:
             return EXIT_OK
@@ -603,7 +613,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--kind")
     p.add_argument("--direct-only", action="store_true")
     p.add_argument("--wait", type=float, default=0.0, help="long-poll seconds, max 25")
-    p.add_argument("--on-session-start", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--unread-banner", action="store_true", help=argparse.SUPPRESS)
     p.set_defaults(func=cmd_inbox)
 
     p = sub.add_parser("read", help="print one item in full")

@@ -24,6 +24,9 @@ log = logging.getLogger("aihub.classify.worker")
 KINDS = ("note", "message", "handoff", "issue", "decision", "artifact")
 LEASE_SEC = 300
 CIRCUIT_OPEN_SEC = 900
+# Consecutive auth failures mean an expired login, which no amount of retrying
+# fixes; the worker demotes itself permanently and says so in /health.
+AUTH_FAILURES_BEFORE_DEMOTION = 3
 NEW_TOPICS_PER_DAY = 3
 MAX_TOPICS = 50
 MIN_NEW_TOPIC_CONFIDENCE = 0.70
@@ -59,6 +62,10 @@ class ClassifyWorker:
         self.circuit_open_until = 0.0
         self.inflight = 0
         self.last_error = ""
+        self.auth_failures = 0
+        self.demoted = False
+        self.calls_today = 0
+        self.calls_day = ""
 
     # ------------------------------------------------------------ lifecycle
     async def start(self) -> None:
@@ -111,16 +118,45 @@ class ClassifyWorker:
         except Exception:
             queued = None
         self.app.state.classifier_status = {
-            "ok": True,
-            "engine": self.engine,
+            # ok=False when claude is permanently unusable, so an expired login
+            # is visible rather than an endless quiet retry.
+            "ok": not self.demoted,
+            "engine": "heuristic" if self.demoted else self.engine,
             "queue_depth": int(queued["n"]) if queued else 0,
             "inflight": self.inflight,
             "circuit_open": time.time() < self.circuit_open_until,
+            "calls_today": self.calls_today,
+            "daily_call_limit": self.cfg.classify.max_calls_per_day,
             "last_error": self.last_error[:200],
         }
 
     def _claude_usable(self) -> bool:
-        return self.engine == "claude" and time.time() >= self.circuit_open_until
+        if self.demoted or self.engine != "claude":
+            return False
+        if time.time() < self.circuit_open_until:
+            return False
+        return self._budget_left() > 0
+
+    def _budget_left(self) -> int:
+        """Remaining claude invocations for today.
+
+        The hub spends the owner's subscription rate limit, not a metered
+        balance, so an unbounded upload loop would lock the owner out of their
+        own Claude Code rather than produce a bill.
+        """
+        day = time.strftime("%Y-%m-%d", time.gmtime())
+        if day != self.calls_day:
+            self.calls_day, self.calls_today = day, 0
+        return max(0, self.cfg.classify.max_calls_per_day - self.calls_today)
+
+    def _spend_call(self) -> None:
+        self._budget_left()
+        self.calls_today += 1
+        if self.calls_today == self.cfg.classify.max_calls_per_day:
+            log.warning(
+                "daily classification budget spent; falling back to rules",
+                extra={"limit": self.cfg.classify.max_calls_per_day},
+            )
 
     def _open_circuit(self, reason: str) -> None:
         self.circuit_open_until = time.time() + CIRCUIT_OPEN_SEC
@@ -305,6 +341,7 @@ class ClassifyWorker:
         if self._claude_usable():
             self.inflight = len(jobs)
             self._publish_status()
+            self._spend_call()
             try:
                 raw_results = await classify_batch(
                     jobs,
@@ -315,6 +352,15 @@ class ClassifyWorker:
                     timeout=float(self.cfg.classify.timeout_sec),
                 )
             except ClaudeUnavailable as exc:
+                self.auth_failures += 1
+                if self.auth_failures >= AUTH_FAILURES_BEFORE_DEMOTION:
+                    self.demoted = True
+                    log.error(
+                        "claude CLI permanently unusable; classification is now"
+                        " rule-based only. Re-authenticate with `claude /login`"
+                        " on the server host and restart.",
+                        extra={"reason": str(exc)[:200]},
+                    )
                 self._open_circuit(str(exc))
                 raw_results = None
             except ClaudeFailed as exc:
@@ -333,6 +379,7 @@ class ClassifyWorker:
                 self.inflight = 0
 
             if raw_results is not None:
+                self.auth_failures = 0
                 by_ref: Dict[int, Dict[str, Any]] = {}
                 for entry in raw_results:
                     if not isinstance(entry, dict):
@@ -341,8 +388,18 @@ class ClassifyWorker:
                         ref = int(entry.get("ref"))
                     except (TypeError, ValueError):
                         continue
-                    if 0 <= ref < len(jobs) and ref not in by_ref:
-                        by_ref[ref] = entry
+                    if not (0 <= ref < len(jobs)) or ref in by_ref:
+                        continue
+                    # The check value must match the item this ref points at, or
+                    # a reordered response would cross-assign topics silently.
+                    expected = (jobs[ref].get("item_id") or "")[:8]
+                    if str(entry.get("check") or "") != expected:
+                        log.warning(
+                            "discarding classification with a mismatched check value",
+                            extra={"ref": ref},
+                        )
+                        continue
+                    by_ref[ref] = entry
                 for index, job in enumerate(jobs):
                     entry = by_ref.get(index)
                     if entry is None:

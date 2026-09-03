@@ -11,11 +11,15 @@ export AIHUB_HOME AIHUB_CONFIG
 
 PIDFILE="$AIHUB_HOME/server.pid"
 LOGFILE="$AIHUB_HOME/logs/server.log"
+STDOUT_LOG="$AIHUB_HOME/logs/stdout.log"
 
 # uv is at /snap/bin/uv on ds30 and ~/.local/bin/uv on macOS; find whichever exists.
+# Absolute paths come first: `command -v uv` resolves differently under a login
+# shell, a non-interactive ssh command, and a systemd user unit, and those can be
+# different uv versions.
 find_uv() {
   if [ -n "${AIHUB_UV:-}" ] && [ -x "${AIHUB_UV}" ]; then echo "$AIHUB_UV"; return 0; fi
-  for candidate in "$(command -v uv 2>/dev/null || true)" /snap/bin/uv "$HOME/.local/bin/uv" /usr/local/bin/uv; do
+  for candidate in "$HOME/.local/bin/uv" /snap/bin/uv /usr/local/bin/uv "$(command -v uv 2>/dev/null || true)"; do
     [ -n "$candidate" ] && [ -x "$candidate" ] && { echo "$candidate"; return 0; }
   done
   echo "uv not found. Install it from https://docs.astral.sh/uv/ or set AIHUB_UV." >&2

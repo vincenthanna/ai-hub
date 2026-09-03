@@ -1,0 +1,20 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "ai-hub",
+  "description": "Cross-session message hub for Claude Code: hand work off between sessions, machines, and repos.",
+  "owner": {
+    "name": "vincenthanna",
+    "url": "https://github.com/vincenthanna"
+  },
+  "plugins": [
+    {
+      "name": "hub",
+      "source": "./plugins/hub",
+      "description": "Send notes, handoffs, and issues to other Claude Code sessions through an ai-hub server, read what was sent to you, and search everything the hub has stored.",
+      "version": "0.1.0",
+      "author": { "name": "vincenthanna" },
+      "category": "productivity",
+      "keywords": ["session", "handoff", "messaging", "search", "ai-hub"]
+    }
+  ]
+}

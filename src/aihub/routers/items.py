@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import shutil
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import ValidationError
@@ -12,7 +15,13 @@ from starlette.datastructures import UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
 from ..auth import require_token
-from ..errors import AIHubError, InvalidRequest, PayloadTooLarge
+from ..config import MIN_FREE_BYTES
+from ..errors import (
+    AIHubError,
+    InvalidRequest,
+    PayloadTooLarge,
+    StorageUnavailable,
+)
 from ..models import ItemCreate
 from ..pagination import clamp_limit, decode_cursor, encode_cursor
 from ..storage.blobs import BlobTooLarge
@@ -48,6 +57,18 @@ def _split(value: Optional[str]) -> Optional[List[str]]:
 async def create_item(request: Request) -> JSONResponse:
     cfg = request.app.state.config
     repo = request.app.state.repo
+
+    # The data root usually shares a volume with everything else on the host, so
+    # running it dry is a whole-machine failure, not just a hub failure.
+    try:
+        free = shutil.disk_usage(str(cfg.home)).free
+    except OSError:
+        free = None
+    if free is not None and free < MIN_FREE_BYTES:
+        raise StorageUnavailable(
+            "server is low on disk (%d bytes free); uploads are paused" % free
+        )
+
     content_type = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
 
     prepared: List[PreparedAttachment] = []
@@ -202,9 +223,19 @@ async def download_attachment(request: Request, item_id: str, attachment_id: str
         from ..errors import NotFound
 
         raise NotFound("attachment blob is missing on disk")
+    # Serving an uploader-supplied content type from this origin would let an
+    # .html attachment execute as a same-origin page. The declared type is
+    # returned as metadata on the item instead.
+    safe_name = re.sub(r'[^A-Za-z0-9._-]+', "_", att["filename"])[:120] or "attachment"
     return FileResponse(
         str(path),
-        media_type=att["media_type"],
-        filename=att["filename"],
-        headers={"ETag": '"%s"' % att["sha256"], "X-AIHub-Sha256": att["sha256"]},
+        media_type="application/octet-stream",
+        headers={
+            "ETag": '"%s"' % att["sha256"],
+            "X-AIHub-Sha256": att["sha256"],
+            "X-AIHub-Media-Type": att["media_type"],
+            "X-Content-Type-Options": "nosniff",
+            "Content-Disposition": "attachment; filename=\"%s\"; filename*=UTF-8''%s"
+            % (safe_name, quote(att["filename"], safe="")),
+        },
     )

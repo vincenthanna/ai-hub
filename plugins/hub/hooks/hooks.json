@@ -1,0 +1,17 @@
+{
+  "description": "ai-hub: announce unread messages at session start, only when the user opts in",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/sh \"${CLAUDE_PLUGIN_ROOT}/hooks/session-start.sh\"",
+            "timeout": 8
+          }
+        ]
+      }
+    ]
+  }
+}
