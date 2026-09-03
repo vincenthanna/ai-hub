@@ -9,6 +9,7 @@ Exit codes carry meaning so the calling skill can react without parsing text:
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import mimetypes
 import os
@@ -39,10 +40,19 @@ EXIT_NOTFOUND = 4
 RETRY_STATUSES = (429, 500, 502, 503, 504)
 
 
+#: Set when this process is already a fallback re-exec, to stop a loop.
+REEXEC_GUARD = "AIHUB_NO_REEXEC"
+FALLBACK_INTERPRETERS = ("/usr/bin/python3",)
+
+
 class HubError(Exception):
     def __init__(self, message: str, code: int = EXIT_SERVER) -> None:
         super().__init__(message)
         self.code = code
+
+
+class LocalNetworkBlocked(HubError):
+    """macOS refused local-network access to this interpreter."""
 
 
 # --------------------------------------------------------------------- config
@@ -185,11 +195,56 @@ def _request(
             )
         except (urllib.error.URLError, socket.timeout, OSError) as exc:
             last_error = str(getattr(exc, "reason", exc))
+            if _looks_like_local_network_block(exc):
+                raise LocalNetworkBlocked(_local_network_hint(cfg, last_error), EXIT_SERVER)
             if attempt < retries - 1:
                 time.sleep(0.5 * (2 ** attempt))
                 continue
             raise HubError("cannot reach %s (%s)" % (cfg.url, last_error), EXIT_SERVER)
     raise HubError("cannot reach %s (%s)" % (cfg.url, last_error), EXIT_SERVER)
+
+
+def _looks_like_local_network_block(exc: BaseException) -> bool:
+    """Recognise macOS denying local-network access to this interpreter.
+
+    macOS grants that permission per binary. A Python installed by pyenv or
+    Homebrew is a different binary from /usr/bin/python3, so it gets its own
+    (initially absent) grant and every LAN connection fails with EHOSTUNREACH
+    even though curl on the same machine succeeds.
+    """
+    if sys.platform != "darwin":
+        return False
+    err = getattr(exc, "reason", exc)
+    return getattr(err, "errno", None) in (errno.EHOSTUNREACH, errno.ENETUNREACH)
+
+
+def _local_network_hint(cfg: "Config", detail: str) -> str:
+    return (
+        "cannot reach %s (%s)\n"
+        "\n"
+        "On macOS this usually means this Python is not allowed to use the local\n"
+        "network. The permission is granted per binary, so %s\n"
+        "may be blocked while /usr/bin/python3 and curl work.\n"
+        "\n"
+        "Check with:\n"
+        "  curl -sS %s/health\n"
+        "If curl succeeds, either allow this interpreter under\n"
+        "System Settings > Privacy & Security > Local Network, or run the client\n"
+        "with the system interpreter:\n"
+        "  /usr/bin/python3 %s ping"
+        % (cfg.url, detail, sys.executable, cfg.url, __file__)
+    )
+
+
+def _fallback_interpreter() -> Optional[str]:
+    """An interpreter that may already hold the local-network grant."""
+    if os.environ.get(REEXEC_GUARD):
+        return None
+    here = os.path.realpath(sys.executable)
+    for candidate in FALLBACK_INTERPRETERS:
+        if os.path.exists(candidate) and os.path.realpath(candidate) != here:
+            return candidate
+    return None
 
 
 def _multipart(payload: Dict[str, Any], files: List[Path]) -> Tuple[bytes, str]:
@@ -587,14 +642,24 @@ def build_parser() -> argparse.ArgumentParser:
         prog="hub.py",
         description="ai-hub client: share messages and work context between AI sessions.",
     )
-    parser.add_argument("--server", help="hub base URL (overrides config)")
-    parser.add_argument("--token", help="auth token (overrides config)")
-    parser.add_argument("--label", help="this session's name (overrides config)")
-    parser.add_argument("--json", action="store_true", help="emit raw JSON")
+    # Shared by the top level and every subcommand, so `hub.py list --json` and
+    # `hub.py --json list` both work. SUPPRESS keeps an absent flag from
+    # overwriting a value that was given at the other level.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--server", default=argparse.SUPPRESS,
+                        help="hub base URL (overrides config)")
+    common.add_argument("--token", default=argparse.SUPPRESS,
+                        help="auth token (overrides config)")
+    common.add_argument("--label", default=argparse.SUPPRESS,
+                        help="this session's name (overrides config)")
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                        help="emit raw JSON")
+    for action in common._actions:
+        parser._add_action(action)
     parser.add_argument("--version", action="version", version="ai-hub client %s" % VERSION)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("send", help="upload a note, message, or handoff")
+    p = sub.add_parser("send", help="upload a note, message, or handoff", parents=[common])
     p.add_argument("--title", required=True)
     p.add_argument("--body-file", help="path to the markdown body (preferred)")
     p.add_argument("--body", help="inline body text")
@@ -608,7 +673,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--client-msg-id", help="idempotency key; generated when omitted")
     p.set_defaults(func=cmd_send)
 
-    p = sub.add_parser("inbox", help="list messages waiting for this session")
+    p = sub.add_parser("inbox", help="list messages waiting for this session", parents=[common])
     p.add_argument("--limit", type=int, default=20)
     p.add_argument("--kind")
     p.add_argument("--direct-only", action="store_true")
@@ -616,19 +681,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--unread-banner", action="store_true", help=argparse.SUPPRESS)
     p.set_defaults(func=cmd_inbox)
 
-    p = sub.add_parser("read", help="print one item in full")
+    p = sub.add_parser("read", help="print one item in full", parents=[common])
     p.add_argument("item_id")
     p.add_argument("--out", help="write the body to this file instead of stdout")
     p.add_argument("--ack", action="store_true", help="acknowledge after reading")
     p.set_defaults(func=cmd_read)
 
-    p = sub.add_parser("ack", help="mark messages handled")
+    p = sub.add_parser("ack", help="mark messages handled", parents=[common])
     p.add_argument("item_ids", nargs="*")
     p.add_argument("--all", action="store_true")
     p.add_argument("--note", default="")
     p.set_defaults(func=cmd_ack)
 
-    p = sub.add_parser("search", help="keyword search across everything stored")
+    p = sub.add_parser("search", help="keyword search across everything stored", parents=[common])
     p.add_argument("query", nargs="+")
     p.add_argument("--limit", type=int, default=10)
     p.add_argument("--topic")
@@ -638,7 +703,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--since", help="7d, 12h, 30m, or an RFC3339 timestamp")
     p.set_defaults(func=cmd_search)
 
-    p = sub.add_parser("list", help="recent items, newest first")
+    p = sub.add_parser("list", help="recent items, newest first", parents=[common])
     p.add_argument("--limit", type=int, default=20)
     p.add_argument("--topic")
     p.add_argument("--kind")
@@ -646,19 +711,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--since")
     p.set_defaults(func=cmd_list)
 
-    sub.add_parser("topics", help="topic catalogue with item counts").set_defaults(func=cmd_topics)
-    sub.add_parser("agents", help="labels the hub has seen").set_defaults(func=cmd_agents)
+    sub.add_parser("topics", help="topic catalogue with item counts", parents=[common]).set_defaults(func=cmd_topics)
+    sub.add_parser("agents", help="labels the hub has seen", parents=[common]).set_defaults(func=cmd_agents)
 
-    p = sub.add_parser("fetch", help="download an attachment")
+    p = sub.add_parser("fetch", help="download an attachment", parents=[common])
     p.add_argument("item_id")
     p.add_argument("attachment_id")
     p.add_argument("--out")
     p.set_defaults(func=cmd_fetch)
 
-    sub.add_parser("whoami", help="show the resolved label, server, and token state").set_defaults(
+    sub.add_parser("whoami", help="show the resolved label, server, and token state", parents=[common]).set_defaults(
         func=cmd_whoami
     )
-    sub.add_parser("ping", help="check the server is reachable").set_defaults(func=cmd_ping)
+    sub.add_parser("ping", help="check the server is reachable", parents=[common]).set_defaults(func=cmd_ping)
 
     p = sub.add_parser("init", help="write ~/.config/ai-hub/client.json")
     p.add_argument("--url")
@@ -666,12 +731,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--label")
     p.add_argument("--auto-inbox", dest="auto_inbox", action="store_true", default=None)
     p.add_argument("--no-auto-inbox", dest="auto_inbox", action="store_false")
+    p.add_argument("--server", default=argparse.SUPPRESS)
+    p.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     p.set_defaults(func=cmd_init)
     return parser
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    # The shared flags use SUPPRESS so either level can set them; fill in the
+    # defaults for whichever the caller left out.
+    for name, fallback in (("server", None), ("token", None), ("label", None), ("json", False)):
+        if not hasattr(args, name):
+            setattr(args, name, fallback)
     try:
         cfg = Config(args)
     except Exception as exc:
@@ -687,6 +759,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         return EXIT_CONFIG
     try:
         return args.func(cfg, args)
+    except LocalNetworkBlocked as exc:
+        # The permission is per binary, so another interpreter on the same
+        # machine may well be allowed. Try one before giving up.
+        alt = _fallback_interpreter()
+        if alt is not None:
+            env = dict(os.environ, **{REEXEC_GUARD: "1"})
+            try:
+                return subprocess.call([alt, os.path.abspath(__file__)] + list(argv or sys.argv[1:]), env=env)
+            except OSError:
+                pass
+        sys.stderr.write("%s\n" % exc)
+        return exc.code
     except HubError as exc:
         sys.stderr.write("%s\n" % exc)
         return exc.code
