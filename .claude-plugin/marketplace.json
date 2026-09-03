@@ -11,7 +11,7 @@
       "name": "hub",
       "source": "./plugins/hub",
       "description": "Send notes, handoffs, and issues to other Claude Code sessions through an ai-hub server, read what was sent to you, and search everything the hub has stored.",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "author": { "name": "vincenthanna" },
       "category": "productivity",
       "keywords": ["session", "handoff", "messaging", "search", "ai-hub"]

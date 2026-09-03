@@ -24,7 +24,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 DEFAULT_URL = "http://192.168.49.48:16001"
 USER_CONFIG = Path(
     os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
