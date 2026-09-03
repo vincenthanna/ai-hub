@@ -18,12 +18,42 @@ Loaded only when the skill needs detail beyond the routing table in `SKILL.md`.
 | `fetch` | `<item_id> <attachment_id>`, `--out` | writes the attachment to disk |
 | `whoami` | — | resolved label, server, token state, config paths |
 | `ping` | — | `ok <url> <latency>ms status=... items=... classifier=...` |
+| `setup` | `--from-server USER@HOST`, `--token`, `--url`, `--label`, `--remote USER@HOST`, `--repo-path`, `--dry-run` | configures this machine, or installs and configures a remote one over ssh |
 | `init` | `--url`, `--token`, `--label`, `--auto-inbox` / `--no-auto-inbox` | writes `~/.config/ai-hub/client.json` at mode 0600 |
 
 Every subcommand accepts `--json` for the raw server payload, plus the global
 `--server`, `--token`, and `--label` overrides.
 
 `--since` takes `7d`, `12h`, `30m`, or an RFC3339 timestamp.
+
+## Setting up a machine
+
+`setup` covers the two halves of onboarding. Without `--remote` it configures
+the machine it runs on: it obtains the token (given directly, read from the
+server host over ssh, or reused from an existing config), writes
+`~/.config/ai-hub/client.json` at mode 0600, and verifies the result against
+both `/health` and an authenticated route.
+
+```bash
+hub.py setup --from-server yeonhui@192.168.49.48 --label my-laptop
+hub.py setup --token <token> --url http://192.168.49.48:16001 --label my-laptop
+```
+
+With `--remote` it installs onto another host over ssh: it checks that host has
+a `claude` CLI and `python3`, adds the marketplace, installs the plugin,
+configures it, and runs `ping` there. The label defaults to the remote host's
+own hostname, because deriving it from `user@ip` yields nothing usable. The
+token never appears in an argv element on either side — the script travels over
+stdin and the token is masked in the printed output.
+
+```bash
+hub.py setup --remote yeonhui@ds29 --dry-run   # print the commands, run nothing
+hub.py setup --remote yeonhui@ds29             # install for real
+```
+
+`--remote` changes another machine, so the skill confirms the target with the
+user before running it. `PREFLIGHT_FAIL` in the output means the remote host is
+missing the `claude` CLI or `python3`.
 
 ## Addressing
 

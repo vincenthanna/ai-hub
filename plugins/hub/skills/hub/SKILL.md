@@ -1,7 +1,7 @@
 ---
 name: hub
-description: ai-hub 서버로 다른 Claude Code 세션과 작업 내용을 주고받고 과거 기록을 검색한다. send/inbox/read/ack/search/list/topics 를 라우팅한다. 트리거는 "허브에 올려", "다른 세션에 전달", "인수인계 남겨", "이어받게 해줘", "허브 확인", "나한테 온 거", "받은 메시지", "허브에서 찾아", "예전에 올린", "send to hub", "hand off to another session", "check my hub inbox", "any messages for me", "search the hub". 로컬 파일 검색이나 git 이력 조회에는 쓰지 않는다.
-argument-hint: [send|inbox|read|ack|search|list|topics|agents|ping]
+description: ai-hub 서버로 다른 Claude Code 세션과 작업 내용을 주고받고 과거 기록을 검색한다. send/inbox/read/ack/search/list/topics/setup 을 라우팅하며, 새 머신 설치와 설정도 여기서 한다. 트리거는 "허브에 올려", "다른 세션에 전달", "인수인계 남겨", "이어받게 해줘", "허브 확인", "나한테 온 거", "받은 메시지", "허브에서 찾아", "예전에 올린", "허브 설정", "허브 설치", "다른 머신에 설치", "send to hub", "hand off to another session", "check my hub inbox", "search the hub", "set up ai-hub". 로컬 파일 검색이나 git 이력 조회에는 쓰지 않는다.
+argument-hint: [send|inbox|read|ack|search|list|topics|agents|setup|ping]
 allowed-tools:
   - Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/hub.py" *)
   - Read
@@ -31,6 +31,7 @@ HUB="python3 ${CLAUDE_PLUGIN_ROOT}/scripts/hub.py"
 | `list` | 최근 목록 | `$HUB list --limit 20` |
 | `topics` / `agents` | 카탈로그 조회 | `$HUB topics` / `$HUB agents` |
 | `ping` / `whoami` | 연결과 설정 확인 | `$HUB ping` / `$HUB whoami` |
+| `setup`, "허브 설정", "설치" | 이 머신 설정 또는 원격 머신 설치 | 아래 §설치와 설정 |
 
 ## 전송 절차
 
@@ -58,6 +59,40 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/hub.py" send \
 
 topic 은 지정하지 않아도 된다. 서버가 자동으로 분류한다.
 사용자가 topic 을 명시하면 그 값이 우선하고 자동 분류가 덮어쓰지 않는다.
+
+## 설치와 설정
+
+### 이 머신이 아직 설정되지 않았을 때
+
+`$HUB whoami` 가 `token = MISSING` 을 보이거나 어떤 명령이 종료 코드 1을 내면 설정이 없는 것이다.
+토큰은 허브 서버가 도는 호스트에 있다. ssh 로 그 호스트에 접근할 수 있으면 한 줄로 끝난다.
+
+```bash
+$HUB setup --from-server <서버호스트 user@host> --label <이 머신 이름>
+```
+
+ssh 가 안 되면 사용자에게 토큰을 받아서 넘긴다. 토큰은 대화에 그대로 남으므로 먼저 사용자에게
+붙여넣어도 되는지 확인한다.
+
+```bash
+$HUB setup --token <토큰> --url http://<서버>:16001 --label <이 머신 이름>
+```
+
+`--label` 은 다른 세션이 이 머신을 부를 이름이다. 생략하면 git 리포 이름과 호스트명으로 자동 생성한다.
+
+### 다른 머신에 설치할 때
+
+**원격 머신을 변경하는 작업이다. 실행 전에 반드시 사용자에게 대상 호스트를 확인받는다.**
+무엇이 실행될지 먼저 보여주려면 `--dry-run` 을 붙인다.
+
+```bash
+$HUB setup --remote <user@host> --dry-run     # 실행 내용만 출력
+$HUB setup --remote <user@host>               # 실제 설치
+```
+
+원격에서 claude CLI 와 python3 를 먼저 확인하고, 플러그인을 설치한 뒤 설정하고 ping 까지 검증한다.
+라벨은 원격 호스트의 hostname 에서 만든다. 다르게 하려면 `--label` 을 준다.
+`PREFLIGHT_FAIL` 이 나오면 그 호스트에 claude CLI 나 python3 가 없는 것이므로 그것부터 안내한다.
 
 ## 수신 절차
 

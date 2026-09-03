@@ -25,17 +25,30 @@ claude plugin marketplace add vincenthanna/ai-hub --sparse .claude-plugin plugin
 claude plugin install hub@ai-hub --yes
 ```
 
-설치 경로는 `claude plugin details hub@ai-hub`로 확인한다. 그 다음 이 머신의 이름표와 서버 주소,
-토큰을 설정한다. 토큰은 서버를 띄운 호스트에서 `bash scripts/show-token.sh`로 얻는다.
+설치 경로는 `claude plugin details hub@ai-hub`로 확인한다. 그 다음 설정을 한 줄로 끝낸다.
+허브 서버가 도는 호스트에 ssh로 접근할 수 있으면 토큰을 직접 읽어온다.
 
 ```bash
-python3 ~/.claude/plugins/cache/ai-hub/hub/*/scripts/hub.py init \
-  --url http://192.168.49.48:16001 \
-  --token <토큰> \
-  --label my-laptop
-
-python3 ~/.claude/plugins/cache/ai-hub/hub/*/scripts/hub.py ping
+python3 ~/.claude/plugins/cache/ai-hub/hub/*/scripts/hub.py setup \
+  --from-server yeonhui@192.168.49.48 --label my-laptop
 ```
+
+ssh가 안 되면 토큰을 직접 넘긴다. 토큰은 서버 호스트에서 `bash scripts/show-token.sh`로 얻는다.
+
+```bash
+python3 ~/.claude/plugins/cache/ai-hub/hub/*/scripts/hub.py setup \
+  --token <토큰> --url http://192.168.49.48:16001 --label my-laptop
+```
+
+이미 플러그인이 깔린 머신에서 **다른 머신에 원격으로 설치**할 수도 있다. 대상 호스트에 claude CLI와
+python3가 있는지 먼저 확인한 뒤 마켓플레이스 등록, 설치, 설정, 검증까지 한 번에 수행한다.
+
+```bash
+python3 .../hub.py setup --remote user@other-host --dry-run   # 실행할 내용만 출력
+python3 .../hub.py setup --remote user@other-host             # 실제 설치
+```
+
+Claude 세션 안에서는 "허브 설정해줘", "ds29에도 ai-hub 설치해줘"처럼 자연어로 부르면 된다.
 
 `ping`이 `auth=ok`를 출력하면 준비가 끝난 것이다. 이후에는 세션에서 자연어로 쓰면 된다.
 

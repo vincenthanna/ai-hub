@@ -24,7 +24,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "0.1.2"
+VERSION = "0.2.0"
 DEFAULT_URL = "http://192.168.49.48:16001"
 USER_CONFIG = Path(
     os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
@@ -636,6 +636,216 @@ def cmd_fetch(cfg: Config, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+
+# ------------------------------------------------------------------- setup
+MARKETPLACE_SOURCE = "vincenthanna/ai-hub"
+MARKETPLACE_NAME = "ai-hub"
+PLUGIN_REF = "hub@ai-hub"
+
+
+def _run(cmd: List[str], *, timeout: int = 180, check: bool = False) -> Tuple[int, str]:
+    """Run a command, returning (exit code, combined output)."""
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout
+        )
+    except FileNotFoundError:
+        return 127, "%s: not found" % cmd[0]
+    except subprocess.TimeoutExpired:
+        return 124, "timed out after %ds" % timeout
+    out = (proc.stdout or "") + (proc.stderr or "")
+    if check and proc.returncode != 0:
+        raise HubError("%s failed: %s" % (" ".join(cmd[:3]), out.strip()[:300]), EXIT_CONFIG)
+    return proc.returncode, out
+
+
+def _run_stdin(cmd: List[str], stdin_text: str, *, timeout: int = 240) -> Tuple[int, str]:
+    try:
+        proc = subprocess.run(
+            cmd, input=stdin_text, capture_output=True, text=True, timeout=timeout
+        )
+    except FileNotFoundError:
+        return 127, "%s: not found" % cmd[0]
+    except subprocess.TimeoutExpired:
+        return 124, "timed out after %ds" % timeout
+    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+
+def _ssh(host: str, script: str, *, timeout: int = 240) -> Tuple[int, str]:
+    """Run a shell snippet on a remote host, feeding it over stdin.
+
+    Passing the script on stdin instead of as an argv element keeps quoting out
+    of the picture entirely, which matters because the script carries a token.
+    """
+    return _run_stdin(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, "bash -s"],
+        script,
+        timeout=timeout,
+    )
+
+
+def _fetch_token_over_ssh(host: str, repo_path: str) -> str:
+    """Read the shared token from the server host's checkout."""
+    # A quoted "~/..." never expands, so resolve it to $HOME on the remote side.
+    path = repo_path
+    if path.startswith("~/"):
+        path = '"$HOME"/' + path[2:]
+    elif path == "~":
+        path = '"$HOME"'
+    else:
+        path = '"%s"' % path
+    code, out = _ssh(
+        host,
+        'set -eu\ncd %s\nbash scripts/show-token.sh' % path,
+        timeout=120,
+    )
+    token = ""
+    for line in reversed(out.strip().splitlines()):
+        line = line.strip()
+        if line and " " not in line and len(line) >= 20:
+            token = line
+            break
+    if code != 0 or not token:
+        raise HubError(
+            "could not read the token from %s:%s\n%s\n"
+            "Pass it directly with --token instead." % (host, repo_path, out.strip()[:300]),
+            EXIT_CONFIG,
+        )
+    return token
+
+
+def cmd_setup(cfg: Config, args: argparse.Namespace) -> int:
+    if args.remote:
+        return _setup_remote(cfg, args)
+    return _setup_local(cfg, args)
+
+
+def _setup_local(cfg: Config, args: argparse.Namespace) -> int:
+    out("configuring this machine")
+    url = (args.url or cfg.url).rstrip("/")
+    label = _sanitize_label(args.label or cfg.label)
+
+    token = args.token or ""
+    if not token and args.from_server:
+        out("  reading the token from %s:%s" % (args.from_server, args.repo_path))
+        token = _fetch_token_over_ssh(args.from_server, args.repo_path)
+    if not token:
+        token = cfg.token
+    if not token:
+        raise HubError(
+            "no token available.\n"
+            "Either pass --token <token>, or let this fetch it from the server host:\n"
+            "  hub.py setup --from-server <user@host>\n"
+            "On the server host the token comes from: bash scripts/show-token.sh",
+            EXIT_CONFIG,
+        )
+
+    USER_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    existing = _read_json(USER_CONFIG)
+    existing.update({"server": url, "token": token, "label": label})
+    if args.auto_inbox is not None:
+        existing["autoInbox"] = bool(args.auto_inbox)
+    existing.setdefault("autoInbox", False)
+    tmp = USER_CONFIG.with_suffix(".json.tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(existing, indent=2, ensure_ascii=False) + "\n")
+    os.replace(tmp, USER_CONFIG)
+    out("  wrote %s (mode 0600)" % USER_CONFIG)
+
+    cfg.url, cfg.token, cfg.label = url, token, label
+    started = time.perf_counter()
+    health = _request(cfg, "GET", "/health", retries=1)
+    _request(cfg, "GET", "/v1/agents", retries=1)
+    out("  verified %s in %.0fms (auth ok, classifier=%s)"
+        % (url, (time.perf_counter() - started) * 1000,
+           (health.get("classifier") or {}).get("engine", "?")))
+    out("")
+    out("ready. this session is '%s' on the hub." % label)
+    out("Try: hub.py inbox     or just ask, e.g. \"허브에 나한테 온 거 있나 확인해줘\"")
+    return EXIT_OK
+
+
+REMOTE_INSTALL_SCRIPT = r"""set -eu
+CB=""
+for c in "$HOME/.local/bin/claude" "$HOME/.claude/local/claude" /usr/local/bin/claude /opt/homebrew/bin/claude; do
+  [ -x "$c" ] && CB="$c" && break
+done
+[ -n "$CB" ] || CB="$(command -v claude 2>/dev/null || true)"
+if [ -z "$CB" ]; then echo "PREFLIGHT_FAIL: claude CLI not found on this host"; exit 10; fi
+command -v python3 >/dev/null 2>&1 || { echo "PREFLIGHT_FAIL: python3 not found"; exit 11; }
+echo "claude: $CB"
+echo "python3: $(command -v python3) ($(python3 -V 2>&1))"
+"$CB" plugin marketplace add __SOURCE__ --sparse .claude-plugin plugins 2>&1 | tail -3 || \
+  "$CB" plugin marketplace update __MARKETPLACE__ 2>&1 | tail -2
+"$CB" plugin install __PLUGIN__ --yes 2>&1 | tail -3
+HUBPY="$(ls -d "$HOME"/.claude/plugins/cache/__MARKETPLACE__/hub/*/scripts/hub.py 2>/dev/null | tail -1)"
+[ -n "$HUBPY" ] || { echo "PREFLIGHT_FAIL: installed hub.py not found"; exit 12; }
+echo "client: $HUBPY"
+LABEL='__LABEL__'
+# Fall back to the remote host's own name: deriving it locally from user@host
+# turns an IP address into a useless label like "192".
+if [ -z "$LABEL" ]; then
+  LABEL="$(hostname -s 2>/dev/null || hostname)"
+  LABEL="$(printf '%s' "$LABEL" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9._-' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//')"
+fi
+echo "label: $LABEL"
+python3 "$HUBPY" init --url '__URL__' --token '__TOKEN__' --label "$LABEL" 2>&1 | tail -3
+python3 "$HUBPY" ping 2>&1 | tail -2
+"""
+
+
+def _setup_remote(cfg: Config, args: argparse.Namespace) -> int:
+    host = args.remote
+    url = (args.url or cfg.url).rstrip("/")
+    token = args.token or cfg.token
+    if not token and args.from_server:
+        token = _fetch_token_over_ssh(args.from_server, args.repo_path)
+    if not token:
+        raise HubError(
+            "no token to install on %s. Pass --token, or --from-server <user@host>." % host,
+            EXIT_CONFIG,
+        )
+    # Left empty when unset: the remote side derives it from its own hostname,
+    # since user@ip gives nothing usable.
+    label = _sanitize_label(args.label) if args.label else ""
+
+    script = (
+        REMOTE_INSTALL_SCRIPT
+        .replace("__SOURCE__", MARKETPLACE_SOURCE)
+        .replace("__MARKETPLACE__", MARKETPLACE_NAME)
+        .replace("__PLUGIN__", PLUGIN_REF)
+        .replace("__URL__", url)
+        .replace("__LABEL__", label)
+    )
+
+    if args.dry_run:
+        out("would run on %s:" % host)
+        out("")
+        for line in script.replace("__TOKEN__", "<token>").splitlines():
+            out("  " + line)
+        return EXIT_OK
+
+    out("installing ai-hub client on %s" % host)
+    out("  hub url : %s" % url)
+    out("  label   : %s" % (label or "(derived from the remote hostname)"))
+    code, output = _ssh(host, script.replace("__TOKEN__", token), timeout=420)
+    for line in output.strip().splitlines():
+        if token and token in line:
+            line = line.replace(token, "<token>")
+        out("  " + line)
+    if code != 0 or "PREFLIGHT_FAIL" in output:
+        raise HubError("remote setup failed on %s (exit %d)" % (host, code), EXIT_SERVER)
+    out("")
+    remote_label = label
+    for line in output.splitlines():
+        if line.startswith("label: "):
+            remote_label = line[7:].strip()
+    out("%s is set up as '%s'. Messages addressed to that label will reach it."
+        % (host, remote_label))
+    return EXIT_OK
+
+
 # --------------------------------------------------------------------- CLI
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -725,6 +935,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub.add_parser("ping", help="check the server is reachable", parents=[common]).set_defaults(func=cmd_ping)
 
+    p = sub.add_parser(
+        "setup",
+        help="configure this machine, or install and configure a remote one",
+        parents=[common],
+    )
+    p.add_argument("--remote", metavar="USER@HOST",
+                   help="install the plugin on this host over ssh instead of configuring locally")
+    p.add_argument("--url", help="hub base URL (default: current config)")
+    p.add_argument("--from-server", metavar="USER@HOST",
+                   help="read the shared token from the hub server host over ssh")
+    p.add_argument("--repo-path", default="~/workspace/ai-hub",
+                   help="server checkout path used with --from-server")
+    p.add_argument("--auto-inbox", dest="auto_inbox", action="store_true", default=None)
+    p.add_argument("--no-auto-inbox", dest="auto_inbox", action="store_false")
+    p.add_argument("--dry-run", action="store_true",
+                   help="with --remote, print the commands without running them")
+    p.set_defaults(func=cmd_setup)
+
     p = sub.add_parser("init", help="write ~/.config/ai-hub/client.json")
     p.add_argument("--url")
     p.add_argument("--token")
@@ -750,7 +978,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         sys.stderr.write("configuration error: %s\n" % exc)
         return EXIT_CONFIG
 
-    if args.command not in ("init", "whoami") and not cfg.token:
+    if args.command not in ("init", "whoami", "setup") and not cfg.token:
         sys.stderr.write(
             "no auth token configured.\n"
             "Run: %s init --url %s --token <token> --label <name>\n"

@@ -20,6 +20,27 @@ claude plugin install hub@ai-hub --yes
 
 ## Configure
 
+The quickest path, when you can ssh to the machine running the hub server:
+
+```bash
+python3 ~/.claude/plugins/cache/ai-hub/hub/*/scripts/hub.py setup \
+  --from-server yeonhui@192.168.49.48 --label my-laptop
+```
+
+That reads the shared token from the server host, writes the config, and
+verifies the connection. To install onto a different machine entirely, from a
+machine that already has the plugin:
+
+```bash
+python3 .../hub.py setup --remote user@other-host --dry-run   # preview
+python3 .../hub.py setup --remote user@other-host             # do it
+```
+
+Inside a Claude session both are reachable through the skill: "허브 설정해줘",
+"이 머신에 ai-hub 설치해줘", "ds29에도 설치해줘".
+
+## Configure manually
+
 Point the client at a hub and give this machine a name. The token comes from the
 server host (`bash scripts/show-token.sh` in the server checkout).
 
