@@ -91,9 +91,21 @@ bash scripts/show-token.sh       # 클라이언트에 넣을 토큰 출력
 systemd 사용자 유닛을 등록한다.
 
 ```bash
-bash scripts/install-service.sh  # systemctl --user 유닛 등록 + 기동
+bash scripts/install-service.sh  # systemctl --user 유닛 등록 + 기동 + 재부팅 생존 점검
 journalctl --user -u aihub.service -f
 ```
+
+재부팅 후 자동 기동은 두 가지에 달려 있다. 계정에 linger가 켜져 있어야 로그인 없이도 user manager가
+부팅 때 뜨고, 유닛이 enable되어 있어야 `default.target`이 그것을 끌어올린다. `install-service.sh`가
+끝나면서 이 조건들을 점검하고, 따로 확인하려면 다음을 실행한다.
+
+```bash
+bash scripts/check-reboot-survival.sh
+```
+
+linger가 꺼져 있으면 스크립트가 `sudo loginctl enable-linger $USER`를 알려준다. 실제로 재부팅하지 않고
+부팅 경로만 시험하려면 서비스를 내린 뒤 `systemctl --user start default.target`을 실행한다. 이것이
+부팅 시 user manager가 하는 일과 같다.
 
 개발 머신에서 원격 호스트로 배포하려면 `scripts/deploy.sh`를 쓴다. git pull, 의존성 동기화,
 마이그레이션 전 백업, 재시작, 헬스체크를 순서대로 수행한다.
@@ -132,7 +144,8 @@ scripts/deploy.sh yeonhui@192.168.49.48 /home/yeonhui/workspace/ai-hub
 | 색인 재생성 | `uv run python -m aihub.admin reindex` |
 | 재분류 | `uv run python -m aihub.admin reclassify --failed` |
 | 토큰 교체 | `uv run python -m aihub.admin rotate-token --grace-hours 24` |
-| 로그 | `bash scripts/logs.sh -f` |
+| 로그 | `bash scripts/logs.sh -f` 또는 `journalctl --user -u aihub.service -f` |
+| 재부팅 생존 점검 | `bash scripts/check-reboot-survival.sh` |
 
 토큰 교체는 이전 토큰을 유예 기간 동안 함께 허용하므로 모든 클라이언트를 동시에 고칠 필요가 없다.
 백업은 파일 복사가 아니라 `sqlite3` 백업 API를 쓴다. WAL 모드에서 `cp`는 안전하지 않다.
