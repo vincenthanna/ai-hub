@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# ai-hub runtime data (never commit hub contents)
+data/
+*.db
+*.db-wal
+*.db-shm
+var/
+logs/
+*.log
+*.pid
+
+# local config with secrets
+config.local.json
+.env
+
+# OS
+.DS_Store
