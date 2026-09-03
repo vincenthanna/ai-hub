@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "hub",
   "description": "Send notes, handoffs, and issues to other Claude Code sessions through an ai-hub server, read what was sent to you, and search everything the hub has stored.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "author": { "name": "vincenthanna" },
   "homepage": "https://github.com/vincenthanna/ai-hub",
   "repository": "https://github.com/vincenthanna/ai-hub",

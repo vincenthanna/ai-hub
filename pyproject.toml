@@ -1,6 +1,6 @@
 [project]
 name = "aihub"
-version = "0.1.1"
+version = "0.1.2"
 description = "Message and data hub for cross-session AI (Claude Code) collaboration"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -56,3 +56,20 @@ that is down or unreachable never delays a session.
 project-level `.ai-hub.json`, which beats `~/.config/ai-hub/client.json`.
 A project file may set `label` and `defaultTopic` only; a `token` there is
 ignored with a warning because that file can be committed.
+
+## Troubleshooting
+
+**The skill loads but Claude does not pick it up from a plain request.**
+Claude Code fits every installed skill's description into an 8,000-character
+listing budget and drops the descriptions of the least-used skills when it
+overflows — a freshly installed plugin goes first. Confirm with
+`claude -p "hi" --debug-file /tmp/s.log` and `grep -i "over budget" /tmp/s.log`,
+then raise `skillListingBudgetFraction` (default 0.01) in
+`~/.claude/settings.json`, or disable unused skills with `/skills`. Invoking
+`/hub:hub` explicitly always works regardless of the budget.
+
+**`[Errno 65] No route to host` from python3 while curl works.**
+macOS grants local-network access per binary, so a pyenv or Homebrew python3
+has its own (initially missing) grant. The client detects this and retries once
+under `/usr/bin/python3`. To fix it properly, allow the interpreter under
+System Settings > Privacy & Security > Local Network.

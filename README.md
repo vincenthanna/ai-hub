@@ -45,6 +45,34 @@ python3 ~/.claude/plugins/cache/ai-hub/hub/*/scripts/hub.py ping
 "예전에 이 에러 관련해서 올린 거 찾아줘"
 ```
 
+### 스킬이 이름만 로드되고 자동으로 안 걸릴 때
+
+Claude Code는 설치된 스킬의 description을 합쳐 8,000자 예산 안에 담는다. 예산을 넘으면 호출 이력이
+적은 스킬부터 description을 통째로 버리고 이름만 남긴다. 갓 설치한 스킬이 가장 먼저 버려지므로,
+스킬을 많이 설치한 환경에서는 "허브에 올려줘"라고 해도 모델이 무슨 스킬인지 몰라 엉뚱하게 답한다.
+
+진단은 다음과 같이 한다.
+
+```bash
+claude -p "hi" --debug-file /tmp/skills.log >/dev/null 2>&1
+grep -i "skill listing over budget" /tmp/skills.log
+```
+
+경고가 나오면 `~/.claude/settings.json`에 예산 배수를 올린다. 기본은 컨텍스트의 1%이다.
+
+```json
+{ "skillListingBudgetFraction": 0.02 }
+```
+
+`/skills`로 안 쓰는 스킬을 꺼도 되고, 급할 때는 `/hub:hub`로 직접 호출하면 예산과 무관하게 동작한다.
+
+### macOS에서 연결이 안 될 때
+
+macOS는 로컬 네트워크 접근 권한을 실행 파일 단위로 준다. `curl`은 되는데 pyenv나 Homebrew로 설치한
+`python3`만 `[Errno 65] No route to host`가 나는 경우가 여기에 해당한다. 클라이언트는 이 상황을
+알아채고 시스템 인터프리터로 한 번 재실행하므로 대개 그냥 동작하지만, 근본 해결은 시스템 설정 >
+개인정보 보호 및 보안 > 로컬 네트워크에서 해당 인터프리터를 허용하는 것이다.
+
 ## 서버 실행
 
 Python 3.10 이상과 `uv`가 필요하다. 리포 루트의 `.python-version`이 인터프리터를 고정하므로 배포
@@ -115,9 +143,11 @@ scripts/deploy.sh yeonhui@192.168.49.48 /home/yeonhui/workspace/ai-hub
 라우팅 힌트이지 인증이 아니고 direct 메시지에 기밀성은 없다.** 이 시스템은 서로 신뢰하는 사람들이
 같은 LAN에서 쓰는 것을 전제한다.
 
-방화벽은 필요한 대역으로만 열어야 한다. 서버가 도는 호스트에서 다음과 같이 좁힌다.
+방화벽은 필요한 대역으로만 열어야 한다. 여러 대역에서 접속할 필요가 없다면 서버 호스트에서 다음과
+같이 좁힌다. 대역을 좁히면 다른 서브넷의 세션은 접속하지 못하므로, 실제로 쓰는 대역을 먼저 확인한다.
 
 ```bash
+sudo ufw delete allow 16001/tcp
 sudo ufw allow from 192.168.49.0/24 to any port 16001 proto tcp
 ```
 
