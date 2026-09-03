@@ -30,3 +30,6 @@ else
   echo "[service] not healthy yet; check: journalctl --user -u aihub.service -n 50" >&2
   exit 1
 fi
+
+echo
+exec bash "$REPO_ROOT/scripts/check-reboot-survival.sh"

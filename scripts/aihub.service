@@ -3,7 +3,15 @@
 # or the service dies when the last session ends.
 [Unit]
 Description=ai-hub cross-session message hub
+# network-online.target does not exist in the user manager, so this ordering is
+# a no-op there; the server binds 0.0.0.0 and does not need the network to be up
+# before it starts. It is kept for the case where the unit is copied to a system
+# manager instead.
 After=network-online.target
+# Never stop retrying. The default is to give up after 5 starts in 10 seconds
+# and leave the unit failed until someone intervenes, which is exactly the state
+# you do not want to discover after an unattended reboot.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
