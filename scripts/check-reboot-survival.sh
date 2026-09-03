@@ -65,7 +65,16 @@ else
       "re-run scripts/install-service.sh"
 fi
 
-# 6. Currently up?
+# 6. A clean stop must not leave the unit in 'failed', or status checks and
+#    monitoring cannot distinguish a deliberate stop from a crash.
+SUCCESS="$(systemctl --user show aihub.service -p SuccessExitStatus --value 2>/dev/null)"
+case "$SUCCESS" in
+  *143*) ok "clean SIGTERM stop is treated as success" ;;
+  *) bad "SuccessExitStatus does not cover 143" \
+         "add 'SuccessExitStatus=143 SIGTERM' to [Service] and reinstall" ;;
+esac
+
+# 7. Currently up?
 if systemctl --user is-active aihub.service >/dev/null 2>&1; then
   ok "unit is active right now (MainPID $(systemctl --user show -p MainPID --value aihub.service))"
 else

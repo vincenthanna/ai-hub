@@ -27,6 +27,9 @@ RestartSec=5
 LimitNOFILE=8192
 KillSignal=SIGTERM
 TimeoutStopSec=30
+# `uv run` reports its child's SIGTERM death as exit 143, so a clean stop would
+# otherwise leave the unit in 'failed' and make every status check look alarming.
+SuccessExitStatus=143 SIGTERM
 
 [Install]
 WantedBy=default.target
