@@ -3,11 +3,15 @@
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
-if ! is_running; then
-  echo "[status] not running (no live pid in $PIDFILE)"
+if systemctl --user is-active aihub.service >/dev/null 2>&1; then
+  PID="$(systemctl --user show -p MainPID --value aihub.service 2>/dev/null || echo systemd)"
+  echo "[status] managed by systemd --user (MainPID $PID)"
+elif is_running; then
+  PID="$(running_pid)"
+else
+  echo "[status] not running (no systemd unit active, no live pid in $PIDFILE)"
   exit 1
 fi
-PID="$(running_pid)"
 BODY="$(curl -fsS -m 5 "$(health_url)" 2>/dev/null || true)"
 if [ -z "$BODY" ]; then
   echo "[status] pid $PID alive but $(health_url) is unreachable"

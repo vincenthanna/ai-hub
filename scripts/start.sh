@@ -8,6 +8,14 @@ if is_running; then
   exit 1
 fi
 
+# Starting here while the systemd unit owns the service produces two processes
+# racing for the port; the loser restarts forever.
+if systemctl --user is-active aihub.service >/dev/null 2>&1; then
+  echo "[start] aihub.service is active under systemd --user." >&2
+  echo "[start] use: systemctl --user restart aihub.service" >&2
+  exit 1
+fi
+
 UV="$(find_uv)"
 mkdir -p "$AIHUB_HOME/logs"
 cd "$REPO_ROOT"

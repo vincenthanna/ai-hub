@@ -3,6 +3,13 @@
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
+if systemctl --user is-active aihub.service >/dev/null 2>&1; then
+  echo "[stop] aihub.service is managed by systemd --user; stopping it there" >&2
+  systemctl --user stop aihub.service
+  rm -f "$PIDFILE"
+  exit 0
+fi
+
 if ! is_running; then
   echo "[stop] not running"
   rm -f "$PIDFILE"

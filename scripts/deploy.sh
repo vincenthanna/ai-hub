@@ -30,10 +30,18 @@ if [ -f "\$HOME/.local/share/ai-hub/db/aihub.sqlite3" ]; then
 fi
 
 bash scripts/install.sh
-if systemctl --user list-unit-files 2>/dev/null | grep -q '^aihub.service'; then
+
+# `systemctl --user cat` exits non-zero when the unit does not exist, and unlike
+# grepping list-unit-files it cannot be fooled by output formatting. Mixing the
+# two restart paths leaves the pidfile process holding the port while systemd
+# retries forever, so pick exactly one.
+if systemctl --user cat aihub.service >/dev/null 2>&1; then
+  echo "[deploy] restarting via systemd --user"
   systemctl --user restart aihub.service
-  sleep 3
+  sleep 4
+  systemctl --user is-active aihub.service
 else
+  echo "[deploy] restarting via pidfile scripts"
   bash scripts/restart.sh
 fi
 bash scripts/status.sh
